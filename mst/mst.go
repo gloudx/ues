@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"ues/blockstore"
 
 	"github.com/ipfs/go-cid"
 	"github.com/ipld/go-ipld-prime/datamodel"
@@ -14,8 +15,6 @@ import (
 	selector "github.com/ipld/go-ipld-prime/traversal/selector"
 	selb "github.com/ipld/go-ipld-prime/traversal/selector/builder"
 	"lukechampine.com/blake3"
-
-	"ues/blockstore"
 )
 
 // Tree реализует Merkle Search Tree поверх Blockstore.
@@ -46,39 +45,48 @@ type nodeCache map[string]*node
 
 // NewTree создаёт пустое дерево поверх предоставленного Blockstore.
 func NewTree(bs blockstore.Blockstore) *Tree {
-	return &Tree{bs: bs}
+	return &Tree{
+		bs: bs,
+	}
 }
 
 // Root возвращает CID текущего корня (cid.Undef для пустого дерева).
 func (t *Tree) Root() cid.Cid {
+
 	t.mu.RLock()
 	defer t.mu.RUnlock()
+
 	return t.rootCID
 }
 
 // Load загружает дерево из Blockstore по корневому CID.
 func (t *Tree) Load(ctx context.Context, root cid.Cid) error {
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
 	if !root.Defined() {
 		t.rootCID = cid.Undef
 		return nil
 	}
-	if _, err := t.getNode(ctx, make(nodeCache), root); err != nil {
+
+	if _, err := t.loadNode(ctx, make(nodeCache), root); err != nil {
 		return err
 	}
+
 	t.rootCID = root
+
 	return nil
 }
 
 // Put вставляет или обновляет значение по ключу и возвращает новый корневой CID.
-func (t *Tree) Put(ctx context.Context, key string, value cid.Cid) (cid.Cid, error) {
+func (t *Tree) Put(ctx context.Context, key string, id cid.Cid) (cid.Cid, error) {
 
 	if key == "" {
 		return cid.Undef, errors.New("mst: empty key")
 	}
 
-	if !value.Defined() {
+	if !id.Defined() {
 		return cid.Undef, errors.New("mst: undefined value CID")
 	}
 
@@ -87,7 +95,7 @@ func (t *Tree) Put(ctx context.Context, key string, value cid.Cid) (cid.Cid, err
 
 	cache := make(nodeCache)
 
-	newRoot, _, err := t.putNode(ctx, cache, t.rootCID, key, value)
+	newRoot, _, err := t.putNode(ctx, cache, t.rootCID, key, id)
 	if err != nil {
 		return cid.Undef, err
 	}
@@ -97,8 +105,9 @@ func (t *Tree) Put(ctx context.Context, key string, value cid.Cid) (cid.Cid, err
 	return newRoot, nil
 }
 
-// Delete удаляет ключ, возвращает новый корневой CID и признак, что ключ существовал.
+// Delete удаляет значение по ключу и возвращает новый корневой CID и признак удаления.
 func (t *Tree) Delete(ctx context.Context, key string) (cid.Cid, bool, error) {
+
 	if key == "" {
 		return cid.Undef, false, errors.New("mst: empty key")
 	}
@@ -107,6 +116,7 @@ func (t *Tree) Delete(ctx context.Context, key string) (cid.Cid, bool, error) {
 	defer t.mu.Unlock()
 
 	cache := make(nodeCache)
+
 	newRoot, removed, err := t.deleteNode(ctx, cache, t.rootCID, key)
 	if err != nil {
 		return cid.Undef, false, err
@@ -114,69 +124,94 @@ func (t *Tree) Delete(ctx context.Context, key string) (cid.Cid, bool, error) {
 	if !removed {
 		return t.rootCID, false, nil
 	}
+
 	t.rootCID = newRoot
+
 	return newRoot, true, nil
 }
 
-// Get возвращает значение по ключу.
+// Get возвращает значение по ключу, признак наличия ключа и ошибку.
 func (t *Tree) Get(ctx context.Context, key string) (cid.Cid, bool, error) {
+
 	t.mu.RLock()
 	root := t.rootCID
 	t.mu.RUnlock()
 
 	cache := make(nodeCache)
+
 	return t.find(ctx, cache, root, key)
 }
 
-// Range возвращает все элементы, чей ключ лежит в [start, end].
+// Range возвращает все пары ключ-значение в диапазоне [start, end].
 func (t *Tree) Range(ctx context.Context, start, end string) ([]Entry, error) {
+
 	t.mu.RLock()
 	root := t.rootCID
 	t.mu.RUnlock()
 
 	cache := make(nodeCache)
+
 	var out []Entry
 	if err := t.collectRange(ctx, cache, root, start, end, &out); err != nil {
 		return nil, err
 	}
+
 	return out, nil
 }
 
-// BuildSelector возвращает селектор для обхода MST.
+// BuildSelector строит селектор для обхода всего дерева.
 func BuildSelector() (selector.Selector, error) {
+
 	sb := selb.NewSelectorSpecBuilder(basicnode.Prototype.Any)
+
 	spec := sb.ExploreRecursive(selector.RecursionLimitNone(),
 		sb.ExploreAll(sb.ExploreRecursiveEdge()),
 	).Node()
+
 	return selector.CompileSelector(spec)
 }
 
-func (t *Tree) putNode(ctx context.Context, cache nodeCache, root cid.Cid, key string, value cid.Cid) (cid.Cid, bool, error) {
+// putNode вставляет или обновляет узел в поддереве с корнем root.
+// Возвращает новый корневой CID, признак вставки нового ключа и ошибку.
+func (t *Tree) putNode(ctx context.Context, cache nodeCache, root cid.Cid, key string, id cid.Cid) (cid.Cid, bool, error) {
+
 	if !root.Defined() {
-		nd := &node{Key: key, Value: value}
+		nd := &node{
+			Entry: Entry{
+				Key:   key,
+				Value: id,
+			},
+			Left:   cid.Undef,
+			Right:  cid.Undef,
+			Height: 1,
+			Hash:   nil,
+		}
 		cidNew, _, err := t.storeNode(ctx, cache, nd)
 		return cidNew, true, err
 	}
 
-	current, err := t.getNode(ctx, cache, root)
+	current, err := t.loadNode(ctx, cache, root)
 	if err != nil {
 		return cid.Undef, false, err
 	}
+
 	cur := cloneNode(current)
 
 	var inserted bool
 	switch cmp := strings.Compare(key, cur.Key); {
 	case cmp == 0:
-		cur.Value = value
+		cur.Value = id
+
 	case cmp < 0:
-		newLeft, ins, err := t.putNode(ctx, cache, cur.Left, key, value)
+		newLeft, ins, err := t.putNode(ctx, cache, cur.Left, key, id)
 		if err != nil {
 			return cid.Undef, false, err
 		}
 		cur.Left = newLeft
 		inserted = ins
+
 	default:
-		newRight, ins, err := t.putNode(ctx, cache, cur.Right, key, value)
+		newRight, ins, err := t.putNode(ctx, cache, cur.Right, key, id)
 		if err != nil {
 			return cid.Undef, false, err
 		}
@@ -188,19 +223,25 @@ func (t *Tree) putNode(ctx context.Context, cache nodeCache, root cid.Cid, key s
 	if err != nil {
 		return cid.Undef, false, err
 	}
+
 	cache[cidNew.String()] = balanced
+
 	return cidNew, inserted, nil
 }
 
+// deleteNode удаляет узел по ключу в поддереве с корнем root.
+// Возвращает новый корневой CID, признак удаления ключа и ошибку.
 func (t *Tree) deleteNode(ctx context.Context, cache nodeCache, root cid.Cid, key string) (cid.Cid, bool, error) {
+
 	if !root.Defined() {
 		return cid.Undef, false, nil
 	}
 
-	current, err := t.getNode(ctx, cache, root)
+	current, err := t.loadNode(ctx, cache, root)
 	if err != nil {
 		return cid.Undef, false, err
 	}
+
 	cur := cloneNode(current)
 
 	switch cmp := strings.Compare(key, cur.Key); {
@@ -213,6 +254,7 @@ func (t *Tree) deleteNode(ctx context.Context, cache nodeCache, root cid.Cid, ke
 			return root, false, nil
 		}
 		cur.Left = newLeft
+
 	case cmp > 0:
 		newRight, removed, err := t.deleteNode(ctx, cache, cur.Right, key)
 		if err != nil {
@@ -222,26 +264,34 @@ func (t *Tree) deleteNode(ctx context.Context, cache nodeCache, root cid.Cid, ke
 			return root, false, nil
 		}
 		cur.Right = newRight
+
 	default:
+
 		if !cur.Left.Defined() && !cur.Right.Defined() {
 			return cid.Undef, true, nil
 		}
+
 		if !cur.Left.Defined() {
 			return cur.Right, true, nil
 		}
+
 		if !cur.Right.Defined() {
 			return cur.Left, true, nil
 		}
+
 		_, succNode, err := t.minNode(ctx, cache, cur.Right)
 		if err != nil {
 			return cid.Undef, false, err
 		}
+
 		cur.Key = succNode.Key
 		cur.Value = succNode.Value
+
 		newRight, _, err := t.deleteNode(ctx, cache, cur.Right, succNode.Key)
 		if err != nil {
 			return cid.Undef, false, err
 		}
+
 		cur.Right = newRight
 	}
 
@@ -249,17 +299,25 @@ func (t *Tree) deleteNode(ctx context.Context, cache nodeCache, root cid.Cid, ke
 	if err != nil {
 		return cid.Undef, false, err
 	}
+
 	cache[cidNew.String()] = balanced
+
 	return cidNew, true, nil
 }
 
+// find ищет ключ в поддереве с корнем root.
+// Возвращает значение, признак наличия ключа и ошибку.
 func (t *Tree) find(ctx context.Context, cache nodeCache, root cid.Cid, key string) (cid.Cid, bool, error) {
+
 	currentCID := root
+
 	for currentCID.Defined() {
-		current, err := t.getNode(ctx, cache, currentCID)
+
+		current, err := t.loadNode(ctx, cache, currentCID)
 		if err != nil {
 			return cid.Undef, false, err
 		}
+
 		switch cmp := strings.Compare(key, current.Key); {
 		case cmp == 0:
 			return current.Value, true, nil
@@ -269,34 +327,44 @@ func (t *Tree) find(ctx context.Context, cache nodeCache, root cid.Cid, key stri
 			currentCID = current.Right
 		}
 	}
+
 	return cid.Undef, false, nil
 }
 
+// collectRange собирает все пары ключ-значение в диапазоне [start, end] в поддереве с корнем root.
 func (t *Tree) collectRange(ctx context.Context, cache nodeCache, root cid.Cid, start, end string, out *[]Entry) error {
+
 	if !root.Defined() {
 		return nil
 	}
-	current, err := t.getNode(ctx, cache, root)
+
+	current, err := t.loadNode(ctx, cache, root)
 	if err != nil {
 		return err
 	}
+
 	if start == "" || strings.Compare(start, current.Key) <= 0 {
 		if err := t.collectRange(ctx, cache, current.Left, start, end, out); err != nil {
 			return err
 		}
 	}
+
 	if (start == "" || strings.Compare(start, current.Key) <= 0) && (end == "" || strings.Compare(current.Key, end) <= 0) {
 		*out = append(*out, Entry{Key: current.Key, Value: current.Value})
 	}
+
 	if end == "" || strings.Compare(current.Key, end) < 0 {
 		if err := t.collectRange(ctx, cache, current.Right, start, end, out); err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 
+// balanceNode балансирует узел и возвращает новый сбалансированный узел и его CID.
 func (t *Tree) balanceNode(ctx context.Context, cache nodeCache, n *node) (*node, cid.Cid, error) {
+
 	if err := t.updateNodeMetadata(ctx, cache, n); err != nil {
 		return nil, cid.Undef, err
 	}
@@ -307,14 +375,17 @@ func (t *Tree) balanceNode(ctx context.Context, cache nodeCache, n *node) (*node
 	}
 
 	if balance > 1 {
-		leftNode, err := t.getNode(ctx, cache, n.Left)
+
+		leftNode, err := t.loadNode(ctx, cache, n.Left)
 		if err != nil {
 			return nil, cid.Undef, err
 		}
+
 		leftBal, err := t.balanceFactor(ctx, cache, leftNode)
 		if err != nil {
 			return nil, cid.Undef, err
 		}
+
 		if leftBal < 0 {
 			leftClone := cloneNode(leftNode)
 			rotated, rotatedCID, err := t.rotateLeft(ctx, cache, leftClone)
@@ -324,23 +395,30 @@ func (t *Tree) balanceNode(ctx context.Context, cache nodeCache, n *node) (*node
 			cache[rotatedCID.String()] = rotated
 			n.Left = rotatedCID
 		}
+
 		rotated, rotatedCID, err := t.rotateRight(ctx, cache, n)
+
 		if err != nil {
 			return nil, cid.Undef, err
 		}
+
 		cache[rotatedCID.String()] = rotated
+
 		return rotated, rotatedCID, nil
 	}
 
 	if balance < -1 {
-		rightNode, err := t.getNode(ctx, cache, n.Right)
+
+		rightNode, err := t.loadNode(ctx, cache, n.Right)
 		if err != nil {
 			return nil, cid.Undef, err
 		}
+
 		rightBal, err := t.balanceFactor(ctx, cache, rightNode)
 		if err != nil {
 			return nil, cid.Undef, err
 		}
+
 		if rightBal > 0 {
 			rightClone := cloneNode(rightNode)
 			rotated, rotatedCID, err := t.rotateRight(ctx, cache, rightClone)
@@ -350,11 +428,14 @@ func (t *Tree) balanceNode(ctx context.Context, cache nodeCache, n *node) (*node
 			cache[rotatedCID.String()] = rotated
 			n.Right = rotatedCID
 		}
+
 		rotated, rotatedCID, err := t.rotateLeft(ctx, cache, n)
 		if err != nil {
 			return nil, cid.Undef, err
 		}
+
 		cache[rotatedCID.String()] = rotated
+
 		return rotated, rotatedCID, nil
 	}
 
@@ -362,151 +443,203 @@ func (t *Tree) balanceNode(ctx context.Context, cache nodeCache, n *node) (*node
 	if err != nil {
 		return nil, cid.Undef, err
 	}
+
 	cache[cidNew.String()] = stored
+
 	return stored, cidNew, nil
 }
 
+// rotateLeft выполняет левый поворот вокруг узла x.
 func (t *Tree) rotateLeft(ctx context.Context, cache nodeCache, x *node) (*node, cid.Cid, error) {
+
 	if !x.Right.Defined() {
 		return x, cid.Undef, errors.New("mst: rotateLeft without right child")
 	}
 
-	yNode, err := t.getNode(ctx, cache, x.Right)
+	yNode, err := t.loadNode(ctx, cache, x.Right)
 	if err != nil {
 		return nil, cid.Undef, err
 	}
+
 	y := cloneNode(yNode)
 
 	xClone := cloneNode(x)
 	xClone.Right = y.Left
+
 	xCID, xStored, err := t.storeNode(ctx, cache, xClone)
 	if err != nil {
 		return nil, cid.Undef, err
 	}
+
 	cache[xCID.String()] = xStored
 
 	y.Left = xCID
+
 	yCID, yStored, err := t.storeNode(ctx, cache, y)
 	if err != nil {
 		return nil, cid.Undef, err
 	}
+
 	cache[yCID.String()] = yStored
+
 	return yStored, yCID, nil
 }
 
+// rotateRight выполняет правый поворот вокруг узла y.
 func (t *Tree) rotateRight(ctx context.Context, cache nodeCache, y *node) (*node, cid.Cid, error) {
+
 	if !y.Left.Defined() {
 		return y, cid.Undef, errors.New("mst: rotateRight without left child")
 	}
 
-	xNode, err := t.getNode(ctx, cache, y.Left)
+	xNode, err := t.loadNode(ctx, cache, y.Left)
 	if err != nil {
 		return nil, cid.Undef, err
 	}
+
 	x := cloneNode(xNode)
 
 	yClone := cloneNode(y)
 	yClone.Left = x.Right
+
 	yCID, yStored, err := t.storeNode(ctx, cache, yClone)
 	if err != nil {
 		return nil, cid.Undef, err
 	}
+
 	cache[yCID.String()] = yStored
 
 	x.Right = yCID
+
 	xCID, xStored, err := t.storeNode(ctx, cache, x)
 	if err != nil {
 		return nil, cid.Undef, err
 	}
+
 	cache[xCID.String()] = xStored
+
 	return xStored, xCID, nil
 }
 
+// balanceFactor возвращает баланс-фактор узла.
 func (t *Tree) balanceFactor(ctx context.Context, cache nodeCache, n *node) (int, error) {
+
 	leftHeight, err := t.childHeight(ctx, cache, n.Left)
 	if err != nil {
 		return 0, err
 	}
+
 	rightHeight, err := t.childHeight(ctx, cache, n.Right)
 	if err != nil {
 		return 0, err
 	}
+
 	return leftHeight - rightHeight, nil
 }
 
+// childHeight возвращает высоту дочернего узла по его CID.
 func (t *Tree) childHeight(ctx context.Context, cache nodeCache, cid cid.Cid) (int, error) {
+
 	if !cid.Defined() {
 		return 0, nil
 	}
-	child, err := t.getNode(ctx, cache, cid)
+
+	child, err := t.loadNode(ctx, cache, cid)
 	if err != nil {
 		return 0, err
 	}
+
 	return child.Height, nil
 }
 
+// minNode находит узел с минимальным ключом в поддереве с корнем root.
+// Возвращает его CID, узел и ошибку.
 func (t *Tree) minNode(ctx context.Context, cache nodeCache, root cid.Cid) (cid.Cid, *node, error) {
+
 	if !root.Defined() {
 		return cid.Undef, nil, errors.New("mst: empty subtree")
 	}
+
 	currentCID := root
+
 	for {
-		current, err := t.getNode(ctx, cache, currentCID)
+
+		current, err := t.loadNode(ctx, cache, currentCID)
 		if err != nil {
 			return cid.Undef, nil, err
 		}
+
 		if !current.Left.Defined() {
 			return currentCID, current, nil
 		}
+
 		currentCID = current.Left
 	}
 }
 
-func (t *Tree) getNode(ctx context.Context, cache nodeCache, id cid.Cid) (*node, error) {
+// loadNode загружает узел по CID, используя кэш для оптимизации.
+func (t *Tree) loadNode(ctx context.Context, cache nodeCache, id cid.Cid) (*node, error) {
+
 	if !id.Defined() {
 		return nil, errors.New("mst: undefined cid")
 	}
+
 	if nd, ok := cache[id.String()]; ok {
 		return nd, nil
 	}
-	dm, err := t.bs.GetNodeAny(ctx, id)
+
+	dm, err := t.bs.GetNode(ctx, id)
 	if err != nil {
 		return nil, fmt.Errorf("mst: load node %s: %w", id, err)
 	}
+
 	nd, err := t.nodeFromNode(dm)
 	if err != nil {
 		return nil, err
 	}
+
 	cache[id.String()] = nd
+
 	return nd, nil
 }
 
+// storeNode сохраняет узел в blockstore и возвращает его CID и клонированный узел.
 func (t *Tree) storeNode(ctx context.Context, cache nodeCache, n *node) (cid.Cid, *node, error) {
+
 	if err := t.updateNodeMetadata(ctx, cache, n); err != nil {
 		return cid.Undef, nil, err
 	}
+
 	dm, err := t.nodeToNode(n)
 	if err != nil {
 		return cid.Undef, nil, err
 	}
-	c, err := t.bs.PutNode(ctx, dm, blockstore.DefaultLP)
+
+	c, err := t.bs.PutNode(ctx, dm)
 	if err != nil {
 		return cid.Undef, nil, fmt.Errorf("mst: store node: %w", err)
 	}
+
 	stored := cloneNode(n)
+
 	cache[c.String()] = stored
+
 	return c, stored, nil
 }
 
+// updateNodeMetadata обновляет высоту и хеш узла на основе его детей.
 func (t *Tree) updateNodeMetadata(ctx context.Context, cache nodeCache, n *node) error {
+
 	leftHeight, leftHash, err := t.childHeightAndHash(ctx, cache, n.Left)
 	if err != nil {
 		return err
 	}
+
 	rightHeight, rightHash, err := t.childHeightAndHash(ctx, cache, n.Right)
 	if err != nil {
 		return err
 	}
+
 	n.Height = 1 + max(leftHeight, rightHeight)
 
 	h := blake3.New(32, nil)
@@ -518,22 +651,30 @@ func (t *Tree) updateNodeMetadata(ctx context.Context, cache nodeCache, n *node)
 	if len(rightHash) > 0 {
 		h.Write(rightHash)
 	}
+
 	n.Hash = h.Sum(nil)
+
 	return nil
 }
 
+// childHeightAndHash возвращает высоту и хеш дочернего узла по его CID.
 func (t *Tree) childHeightAndHash(ctx context.Context, cache nodeCache, id cid.Cid) (int, []byte, error) {
+
 	if !id.Defined() {
 		return 0, nil, nil
 	}
-	nd, err := t.getNode(ctx, cache, id)
+
+	nd, err := t.loadNode(ctx, cache, id)
 	if err != nil {
 		return 0, nil, err
 	}
+
 	return nd.Height, nd.Hash, nil
 }
 
+// nodeToNode преобразует внутреннее представление узла в datamodel.Node.
 func (t *Tree) nodeToNode(n *node) (datamodel.Node, error) {
+
 	size := int64(4)
 	if n.Left.Defined() {
 		size++
@@ -603,10 +744,13 @@ func (t *Tree) nodeToNode(n *node) (datamodel.Node, error) {
 	if err := ma.Finish(); err != nil {
 		return nil, err
 	}
+
 	return builder.Build(), nil
 }
 
+// nodeFromNode преобразует datamodel.Node в внутреннее представление узла.
 func (t *Tree) nodeFromNode(dm datamodel.Node) (*node, error) {
+
 	keyNode, err := dm.LookupByString("key")
 	if err != nil {
 		return nil, fmt.Errorf("mst: node missing key: %w", err)
@@ -668,8 +812,10 @@ func (t *Tree) nodeFromNode(dm datamodel.Node) (*node, error) {
 	}
 
 	return &node{
-		Key:    key,
-		Value:  valueLink.Cid,
+		Entry: Entry{
+			Key:   key,
+			Value: valueLink.Cid,
+		},
 		Left:   leftCID,
 		Right:  rightCID,
 		Height: int(heightVal),
@@ -677,17 +823,20 @@ func (t *Tree) nodeFromNode(dm datamodel.Node) (*node, error) {
 	}, nil
 }
 
+// cloneNode делает поверхностную копию узла.
 func cloneNode(n *node) *node {
+
 	if n == nil {
 		return nil
 	}
+
 	var hashCopy []byte
 	if len(n.Hash) > 0 {
 		hashCopy = append([]byte{}, n.Hash...)
 	}
+
 	return &node{
-		Key:    n.Key,
-		Value:  n.Value,
+		Entry:  n.Entry,
 		Left:   n.Left,
 		Right:  n.Right,
 		Height: n.Height,
@@ -695,6 +844,7 @@ func cloneNode(n *node) *node {
 	}
 }
 
+// max возвращает максимум из двух целых чисел.
 func max(a, b int) int {
 	if a > b {
 		return a
