@@ -414,10 +414,17 @@ func buildCommitNode(root cid.Cid, prev cid.Cid, ts time.Time) (datamodel.Node, 
 	if err != nil {
 		return nil, err
 	}
-	// Присваиваем значение - ссылку на корневой CID индекса репозитория
-	// cidlink.Link оборачивает CID в формат, понятный IPLD
-	if err := entry.AssignLink(cidlink.Link{Cid: root}); err != nil {
-		return nil, err
+	// Проверяем, определен ли корневой CID
+	if root.Defined() {
+		// Если корень определен, создаем ссылку на него
+		if err := entry.AssignLink(cidlink.Link{Cid: root}); err != nil {
+			return nil, err
+		}
+	} else {
+		// Если корень не определен (пустой репозиторий), устанавливаем null
+		if err := entry.AssignNull(); err != nil {
+			return nil, err
+		}
 	}
 
 	// === Добавляем поле "prev" ===
@@ -493,20 +500,28 @@ func parseCommit(node datamodel.Node) (cid.Cid, cid.Cid, error) {
 		return cid.Undef, cid.Undef, fmt.Errorf("commit missing root: %w", err)
 	}
 
-	// Преобразуем найденный узел в ссылку (Link)
-	// В IPLD ссылки представляют CID-указатели на другие узлы
-	rootLink, err := rootNode.AsLink()
-	if err != nil {
-		// Если узел не является ссылкой, структура коммита нарушена
-		return cid.Undef, cid.Undef, fmt.Errorf("commit root is not a link: %w", err)
-	}
+	// Инициализируем CID корня как неопределенный
+	rootCID := cid.Undef
 
-	// Приводим общий тип Link к конкретному типу cidlink.Link
-	// cidlink.Link - это обертка IPLD для CID, содержащая поле Cid
-	rl, ok := rootLink.(cidlink.Link)
-	if !ok {
-		// Если приведение типа не удалось, значит ссылка имеет неожиданный тип
-		return cid.Undef, cid.Undef, fmt.Errorf("commit root link type unexpected")
+	// Проверяем, не является ли поле "root" значением null
+	// null означает пустой репозиторий без коллекций
+	if !rootNode.IsNull() {
+		// Преобразуем найденный узел в ссылку (Link)
+		// В IPLD ссылки представляют CID-указатели на другие узлы
+		rootLink, err := rootNode.AsLink()
+		if err != nil {
+			// Если узел не является ссылкой, структура коммита нарушена
+			return cid.Undef, cid.Undef, fmt.Errorf("commit root is not a link: %w", err)
+		}
+
+		// Приводим общий тип Link к конкретному типу cidlink.Link
+		// cidlink.Link - это обертка IPLD для CID, содержащая поле Cid
+		rl, ok := rootLink.(cidlink.Link)
+		if !ok {
+			// Если приведение типа не удалось, значит ссылка имеет неожиданный тип
+			return cid.Undef, cid.Undef, fmt.Errorf("commit root link type unexpected")
+		}
+		rootCID = rl.Cid
 	}
 
 	// === Извлечение поля "prev" ===
@@ -546,8 +561,8 @@ func parseCommit(node datamodel.Node) (cid.Cid, cid.Cid, error) {
 	}
 
 	// Возвращаем успешно извлеченные CID:
-	// - rl.Cid: CID корневого узла индекса на момент коммита
+	// - rootCID: CID корневого узла индекса на момент коммита (или Undef для пустого репозитория)
 	// - prevCID: CID предыдущего коммита (или Undef для первого коммита)
 	// - nil: отсутствие ошибок при парсинге
-	return rl.Cid, prevCID, nil
+	return rootCID, prevCID, nil
 }
