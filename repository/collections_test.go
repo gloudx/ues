@@ -44,7 +44,7 @@ func TestRepository_CollectionRootHash(t *testing.T) {
 	newHash, exists, err := repo.CollectionRootHash(ctx, "posts")
 	require.NoError(t, err)
 	assert.True(t, exists)
-	assert.NotNil(t, newHash) // После добавления записи хеш должен быть определен
+	assert.NotNil(t, newHash)         // После добавления записи хеш должен быть определен
 	assert.NotEqual(t, hash, newHash) // Хеш должен измениться
 
 	// Проверяем, что CID не пустой
