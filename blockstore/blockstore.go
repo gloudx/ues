@@ -56,10 +56,10 @@ type Blockstore interface {
 	io.Closer
 
 	// PutNode сохраняет любой ipld-prime узел через LinkSystem.Store.
-	PutNode(ctx context.Context, n datamodel.Node, lp cidlink.LinkPrototype) (cid.Cid, error)
+	PutNode(ctx context.Context, n datamodel.Node) (cid.Cid, error)
 
 	// GetNodeAny загружает узел как generic Any (basicnode).
-	GetNodeAny(ctx context.Context, c cid.Cid) (datamodel.Node, error)
+	GetNode(ctx context.Context, c cid.Cid) (datamodel.Node, error)
 
 	// AddFile добавляет файл с использованием UnixFS
 	AddFile(ctx context.Context, data io.Reader, useRabin bool) (cid.Cid, error)
@@ -165,11 +165,11 @@ func (bs *blockstore) PutMany(ctx context.Context, blks []blocks.Block) error {
 }
 
 // PutNode сохраняет любой ipld-prime узел через LinkSystem.Store.
-func (bs *blockstore) PutNode(ctx context.Context, n datamodel.Node, lp cidlink.LinkPrototype) (cid.Cid, error) {
+func (bs *blockstore) PutNode(ctx context.Context, n datamodel.Node) (cid.Cid, error) {
 	if bs.lsys == nil {
 		return cid.Undef, errors.New("links system is nil")
 	}
-	lnk, err := bs.lsys.Store(ipld.LinkContext{Ctx: ctx}, lp, n)
+	lnk, err := bs.lsys.Store(ipld.LinkContext{Ctx: ctx}, DefaultLP, n)
 	if err != nil {
 		return cid.Undef, err
 	}
@@ -194,7 +194,7 @@ func (bs *blockstore) Get(ctx context.Context, c cid.Cid) (blocks.Block, error) 
 }
 
 // GetNodeAny загружает узел как generic Any (basicnode).
-func (bs *blockstore) GetNodeAny(ctx context.Context, c cid.Cid) (datamodel.Node, error) {
+func (bs *blockstore) GetNode(ctx context.Context, c cid.Cid) (datamodel.Node, error) {
 	if bs.lsys == nil {
 		return nil, errors.New("link system is nil")
 	}
@@ -309,7 +309,7 @@ func (bs *blockstore) Close() error {
 // PutStruct — ок
 func PutStruct[T any](ctx context.Context, bs *blockstore, v *T, ts *schema.TypeSystem, typ schema.Type, lp cidlink.LinkPrototype) (cid.Cid, error) {
 	n := bindnode.Wrap(v, typ)
-	return bs.PutNode(ctx, n, lp)
+	return bs.PutNode(ctx, n)
 }
 
 // GetStruct — фикс

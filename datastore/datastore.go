@@ -2,6 +2,7 @@ package datastore
 
 import (
 	"context"
+	"time"
 
 	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-datastore/query"
@@ -207,6 +208,28 @@ func (s *datastorage) Keys(ctx context.Context, prefix ds.Key) (<-chan ds.Key, <
 	}()
 
 	return out, errc, nil
+}
+
+// PutWithTTL сохраняет значение с тайм-аутом жизни. При ttl <= 0 выполняется обычный Put.
+func (s *datastorage) PutWithTTL(ctx context.Context, key ds.Key, value []byte, ttl time.Duration) error {
+	if ttl <= 0 {
+		return s.Datastore.Put(ctx, key, value)
+	}
+	return s.Datastore.PutWithTTL(ctx, key, value, ttl)
+}
+
+// SetTTL обновляет TTL для существующего ключа. При ttl <= 0 TTL снимается.
+func (s *datastorage) SetTTL(ctx context.Context, key ds.Key, ttl time.Duration) error {
+	if ttl <= 0 {
+		// Badger трактует неположительный ttl как снятие таймера.
+		return s.Datastore.SetTTL(ctx, key, 0)
+	}
+	return s.Datastore.SetTTL(ctx, key, ttl)
+}
+
+// GetExpiration возвращает время истечения TTL или zero time, если TTL не установлен.
+func (s *datastorage) GetExpiration(ctx context.Context, key ds.Key) (time.Time, error) {
+	return s.Datastore.GetExpiration(ctx, key)
 }
 
 func (s *datastorage) Close() error {
