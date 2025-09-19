@@ -1,14 +1,13 @@
-package repository
+package mstindex
 
 import (
 	"context"
 	"fmt"
 	"strings"
-
-	"github.com/ipfs/go-cid"
-
 	"ues/blockstore"
 	"ues/mst"
+
+	"github.com/ipfs/go-cid"
 )
 
 const collectionSeparator = "\x00"
@@ -38,8 +37,8 @@ func (i *Index) Root() cid.Cid {
 }
 
 // Put stores a mapping (collection, rkey) -> value CID in the index and returns the new root.
-func (i *Index) Put(ctx context.Context, collection, rkey string, value cid.Cid) (cid.Cid, error) {
-	key, err := keyFor(collection, rkey)
+func (i *Index) Put(ctx context.Context, rkey string, value cid.Cid) (cid.Cid, error) {
+	key, err := keyFor(i.name, rkey)
 	if err != nil {
 		return cid.Undef, err
 	}
@@ -51,8 +50,8 @@ func (i *Index) Put(ctx context.Context, collection, rkey string, value cid.Cid)
 }
 
 // Delete removes an entry from the index.
-func (i *Index) Delete(ctx context.Context, collection, rkey string) (cid.Cid, bool, error) {
-	key, err := keyFor(collection, rkey)
+func (i *Index) Delete(ctx context.Context, rkey string) (cid.Cid, bool, error) {
+	key, err := keyFor(i.name, rkey)
 	if err != nil {
 		return cid.Undef, false, err
 	}
@@ -64,8 +63,8 @@ func (i *Index) Delete(ctx context.Context, collection, rkey string) (cid.Cid, b
 }
 
 // Get retrieves the value CID for collection+rkey.
-func (i *Index) Get(ctx context.Context, collection, rkey string) (cid.Cid, bool, error) {
-	key, err := keyFor(collection, rkey)
+func (i *Index) Get(ctx context.Context, rkey string) (cid.Cid, bool, error) {
+	key, err := keyFor(i.name, rkey)
 	if err != nil {
 		return cid.Undef, false, err
 	}
@@ -76,12 +75,10 @@ func (i *Index) Get(ctx context.Context, collection, rkey string) (cid.Cid, bool
 	return value, ok, nil
 }
 
-const collectionSeparator = "\x00"
-
-// ListCollection returns all entries for a given collection ordered by rkey.
-func (i *Index) ListCollection(ctx context.Context, collection string) ([]mst.Entry, error) {
-	start := collection + collectionSeparator
-	end := collection + string([]byte{collectionSeparator[0] + 1})
+// List returns all entries in the index for the collection.
+func (i *Index) List(ctx context.Context) ([]mst.Entry, error) {
+	start := i.name + collectionSeparator
+	end := i.name + string([]byte{collectionSeparator[0] + 1})
 	entries, err := i.tree.Range(ctx, start, end)
 	if err != nil {
 		return nil, fmt.Errorf("index range: %w", err)
