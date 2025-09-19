@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,8 +28,10 @@ import (
 //   - prev: CID предыдущего коммита (для цепочки истории)
 //   - mu: мьютекс для обеспечения потокобезопасности
 type Repository struct {
-	bs    blockstore.Blockstore
-	index *Index
+	bs          blockstore.Blockstore
+	index       *Index
+	sqliteIndex *SQLiteIndexer   // SQLite индексер для быстрого поиска и запросов
+	lexicons    *LexiconRegistry // Реестр лексиконов для валидации схем
 
 	mu   sync.RWMutex
 	head cid.Cid
@@ -49,7 +52,77 @@ type Repository struct {
 //	repo := New(blockstore)
 //	// Репозиторий готов для добавления записей и создания коммитов
 func New(bs blockstore.Blockstore) *Repository {
-	return &Repository{bs: bs, index: NewIndex(bs)}
+	return &Repository{
+		bs:          bs,
+		index:       NewIndex(bs),
+		sqliteIndex: nil, // SQLite индексер отключен по умолчанию
+		lexicons:    nil, // Лексиконы отключены по умолчанию
+	}
+}
+
+// NewWithLexicons создает новый репозиторий с поддержкой валидации через лексиконы
+//
+// Параметры:
+//   - bs: блочное хранилище для сохранения IPLD данных
+//   - lexicons: реестр лексиконов для валидации схем данных
+//
+// Возвращает:
+//   - *Repository: новый экземпляр репозитория с поддержкой лексиконов
+func NewWithLexicons(bs blockstore.Blockstore, lexicons *LexiconRegistry) *Repository {
+	return &Repository{
+		bs:          bs,
+		index:       NewIndex(bs),
+		sqliteIndex: nil,
+		lexicons:    lexicons,
+	}
+}
+
+// NewWithSQLiteIndex создает новый репозиторий с поддержкой SQLite индексирования
+// для быстрого поиска и запросов по записям.
+//
+// Параметры:
+//   - bs: блочное хранилище для сохранения IPLD данных
+//   - sqliteDBPath: путь к файлу SQLite базы данных для индексирования
+//
+// Возвращает:
+//   - *Repository: новый экземпляр репозитория с SQLite индексером
+//   - error: ошибка инициализации SQLite индексера
+func NewWithSQLiteIndex(bs blockstore.Blockstore, sqliteDBPath string) (*Repository, error) {
+	sqliteIndex, err := NewSQLiteIndexer(sqliteDBPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create SQLite indexer: %w", err)
+	}
+
+	return &Repository{
+		bs:          bs,
+		index:       NewIndex(bs),
+		sqliteIndex: sqliteIndex,
+		lexicons:    nil, // Лексиконы отключены по умолчанию
+	}, nil
+}
+
+// NewWithFullFeatures создает репозиторий с поддержкой SQLite индексирования и лексиконов
+//
+// Параметры:
+//   - bs: блочное хранилище для сохранения IPLD данных
+//   - sqliteDBPath: путь к файлу SQLite базы данных для индексирования
+//   - lexicons: реестр лексиконов для валидации схем данных
+//
+// Возвращает:
+//   - *Repository: новый экземпляр репозитория с полным функционалом
+//   - error: ошибка инициализации компонентов
+func NewWithFullFeatures(bs blockstore.Blockstore, sqliteDBPath string, lexicons *LexiconRegistry) (*Repository, error) {
+	sqliteIndex, err := NewSQLiteIndexer(sqliteDBPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create SQLite indexer: %w", err)
+	}
+
+	return &Repository{
+		bs:          bs,
+		index:       NewIndex(bs),
+		sqliteIndex: sqliteIndex,
+		lexicons:    lexicons,
+	}, nil
 }
 
 // LoadHead загружает состояние репозитория из существующего коммита по его CID.
@@ -162,6 +235,14 @@ func (r *Repository) LoadHead(ctx context.Context, head cid.Cid) error {
 //
 // Важно: изменения индекса остаются в памяти до вызова Commit()
 func (r *Repository) PutRecord(ctx context.Context, collection, rkey string, node datamodel.Node) (cid.Cid, error) {
+	// === ВАЛИДАЦИЯ ЧЕРЕЗ ЛЕКСИКОНЫ ===
+	// Если лексиконы включены, валидируем данные против схемы коллекции
+	if r.lexicons != nil {
+		if err := r.validateRecordWithLexicon(ctx, collection, node); err != nil {
+			return cid.Undef, fmt.Errorf("lexicon validation failed for %s/%s: %w", collection, rkey, err)
+		}
+	}
+
 	// === Сохранение узла записи в blockstore ===
 	// Сериализуем IPLD узел и сохраняем его в блочном хранилище
 	// blockstore автоматически вычисляет CID на основе содержимого узла
@@ -172,7 +253,7 @@ func (r *Repository) PutRecord(ctx context.Context, collection, rkey string, nod
 		return cid.Undef, fmt.Errorf("store record node: %w", err)
 	}
 
-	// === Индексирование записи ===
+	// === Индексирование записи в MST ===
 	// Добавляем mapping от (collection, rkey) к CID в индекс репозитория
 	// Это позволяет быстро находить записи по их логическому адресу
 	// index.Put может изменить структуру MST индекса для поддержания упорядоченности
@@ -182,9 +263,69 @@ func (r *Repository) PutRecord(ctx context.Context, collection, rkey string, nod
 		return cid.Undef, err
 	}
 
+	// === Индексирование записи в SQLite (если включено) ===
+	if r.sqliteIndex != nil {
+		if err := r.indexRecordInSQLite(ctx, valueCID, collection, rkey, node); err != nil {
+			// Логируем ошибку SQLite индексирования, но не прерываем операцию
+			// MST индекс уже обновлен и это основной механизм
+			fmt.Printf("Warning: SQLite indexing failed for %s/%s: %v\n", collection, rkey, err)
+		}
+	}
+
 	// Успешно сохранили и проиндексировали запись
 	// Возвращаем CID для возможности прямого доступа к содержимому
 	return valueCID, nil
+}
+
+// validateRecordWithLexicon валидирует IPLD узел против лексикона коллекции
+//
+// ЛОГИКА ВАЛИДАЦИИ:
+// 1. Определить лексикон для коллекции (по соглашению об именах)
+// 2. Получить схему лексикона из реестра
+// 3. Валидировать узел против IPLD схемы
+// 4. Применить кастомные валидаторы из лексикона
+//
+// Параметры:
+//   - ctx: контекст операции
+//   - collection: имя коллекции (используется для определения лексикона)
+//   - node: IPLD узел для валидации
+//
+// Возвращает:
+//   - error: ошибка валидации или nil при успехе
+func (r *Repository) validateRecordWithLexicon(ctx context.Context, collection string, node datamodel.Node) error {
+	// Конвертируем имя коллекции в LexiconID
+	// Соглашение: collection "posts" -> lexicon "com.example.posts.record"
+	// TODO: Это упрощенная схема, в реальности может быть более сложная логика
+	lexiconID := LexiconID(fmt.Sprintf("com.example.%s.record", collection))
+
+	// Получаем актуальную версию лексикона
+	definition, err := r.lexicons.GetLexicon(ctx, lexiconID, nil) // nil = последняя стабильная версия
+	if err != nil {
+		// Если лексикон не найден, это может быть:
+		// 1. Новая коллекция без определенной схемы (разрешаем)
+		// 2. Ошибка в реестре лексиконов (блокируем)
+		if strings.Contains(err.Error(), "not found") {
+			// Лексикон не найден - разрешаем операцию (backward compatibility)
+			return nil
+		}
+		return fmt.Errorf("failed to get lexicon %s: %w", lexiconID, err)
+	}
+
+	// Проверяем статус лексикона
+	if definition.Status == SchemaStatusArchived {
+		return fmt.Errorf("lexicon %s is archived and cannot be used", lexiconID)
+	}
+
+	if definition.Status == SchemaStatusDeprecated && !r.lexicons.config.AllowDeprecated {
+		return fmt.Errorf("lexicon %s is deprecated and deprecated schemas are disabled", lexiconID)
+	}
+
+	// Валидируем данные против лексикона
+	if err := r.lexicons.ValidateData(ctx, lexiconID, definition.Version, node); err != nil {
+		return fmt.Errorf("data validation failed: %w", err)
+	}
+
+	return nil
 }
 
 // DeleteRecord удаляет mapping записи из индекса репозитория.
@@ -208,6 +349,14 @@ func (r *Repository) PutRecord(ctx context.Context, collection, rkey string, nod
 //
 // Важно: данные в blockstore остаются доступными по CID даже после удаления из индекса
 func (r *Repository) DeleteRecord(ctx context.Context, collection, rkey string) (bool, error) {
+	// Получаем CID записи перед удалением для SQLite индексирования
+	var recordCID cid.Cid
+	if r.sqliteIndex != nil {
+		if cid, found, err := r.index.Get(ctx, collection, rkey); err == nil && found {
+			recordCID = cid
+		}
+	}
+
 	// Вызываем метод Delete индекса для удаления mapping (collection, rkey) -> CID
 	// index.Delete возвращает три значения:
 	// 1. старый CID (который мы игнорируем через _)
@@ -218,6 +367,14 @@ func (r *Repository) DeleteRecord(ctx context.Context, collection, rkey string) 
 		// Если произошла ошибка при удалении (например, проблемы с обновлением MST),
 		// возвращаем false и ошибку операции
 		return false, err
+	}
+
+	// Удаляем из SQLite индекса (если включен и запись была найдена)
+	if r.sqliteIndex != nil && removed && recordCID != cid.Undef {
+		if err := r.sqliteIndex.DeleteRecord(ctx, recordCID); err != nil {
+			// Логируем ошибку SQLite удаления, но не прерываем операцию
+			fmt.Printf("Warning: SQLite deletion failed for %s/%s: %v\n", collection, rkey, err)
+		}
 	}
 
 	// Возвращаем флаг removed, который указывает:
@@ -374,6 +531,57 @@ func (r *Repository) Commit(ctx context.Context) (cid.Cid, error) {
 	// Коммит успешно создан и сохранен
 	// Возвращаем CID нового коммита для использования клиентским кодом
 	return headCID, nil
+}
+
+// SearchRecords выполняет поиск записей через SQLite индексер (если включен)
+// Обеспечивает быстрый поиск с поддержкой фильтров, полнотекстового поиска и сортировки.
+//
+// Параметры:
+//   - ctx: контекст для отмены операции
+//   - query: запрос поиска с фильтрами и параметрами
+//
+// Возвращает:
+//   - []SearchResult: результаты поиска с метаданными
+//   - error: ошибка выполнения поиска или отсутствие SQLite индексера
+func (r *Repository) SearchRecords(ctx context.Context, query SearchQuery) ([]SearchResult, error) {
+	if r.sqliteIndex == nil {
+		return nil, fmt.Errorf("SQLite indexer is not enabled for this repository")
+	}
+
+	return r.sqliteIndex.SearchRecords(ctx, query)
+}
+
+// GetCollectionStats возвращает статистику по коллекции через SQLite индексер
+//
+// Параметры:
+//   - ctx: контекст для отмены операции
+//   - collection: имя коллекции для получения статистики
+//
+// Возвращает:
+//   - map[string]interface{}: статистика коллекции (количество записей, типы, даты)
+//   - error: ошибка получения статистики или отсутствие SQLite индексера
+func (r *Repository) GetCollectionStats(ctx context.Context, collection string) (map[string]interface{}, error) {
+	if r.sqliteIndex == nil {
+		return nil, fmt.Errorf("SQLite indexer is not enabled for this repository")
+	}
+
+	return r.sqliteIndex.GetCollectionStats(ctx, collection)
+}
+
+// HasSQLiteIndex проверяет, включен ли SQLite индексер для этого репозитория
+func (r *Repository) HasSQLiteIndex() bool {
+	return r.sqliteIndex != nil
+}
+
+// CloseSQLiteIndex безопасно закрывает SQLite индексер
+func (r *Repository) CloseSQLiteIndex() error {
+	if r.sqliteIndex == nil {
+		return nil
+	}
+
+	err := r.sqliteIndex.Close()
+	r.sqliteIndex = nil
+	return err
 }
 
 // buildCommitNode создает IPLD узел, представляющий коммит в репозитории.
@@ -565,4 +773,162 @@ func parseCommit(node datamodel.Node) (cid.Cid, cid.Cid, error) {
 	// - prevCID: CID предыдущего коммита (или Undef для первого коммита)
 	// - nil: отсутствие ошибок при парсинге
 	return rootCID, prevCID, nil
+}
+
+// indexRecordInSQLite индексирует запись в SQLite для быстрого поиска
+func (r *Repository) indexRecordInSQLite(ctx context.Context, recordCID cid.Cid, collection, rkey string, node datamodel.Node) error {
+	// Извлекаем данные из IPLD узла
+	data, err := r.extractDataFromNode(node)
+	if err != nil {
+		return fmt.Errorf("failed to extract data from node: %w", err)
+	}
+
+	// Генерируем текст для полнотекстового поиска
+	searchText := r.generateSearchText(data)
+
+	// Создаем метаданные для индексирования
+	metadata := IndexMetadata{
+		Collection: collection,
+		RKey:       rkey,
+		RecordType: r.inferRecordType(collection, data),
+		Data:       data,
+		SearchText: searchText,
+		CreatedAt:  time.Now(),
+		UpdatedAt:  time.Now(),
+	}
+
+	return r.sqliteIndex.IndexRecord(ctx, recordCID, metadata)
+}
+
+// extractDataFromNode извлекает данные из IPLD узла в map[string]interface{}
+func (r *Repository) extractDataFromNode(node datamodel.Node) (map[string]interface{}, error) {
+	result := make(map[string]interface{})
+
+	// Обходим все поля узла
+	iterator := node.MapIterator()
+	for !iterator.Done() {
+		key, value, err := iterator.Next()
+		if err != nil {
+			return nil, err
+		}
+
+		keyStr, err := key.AsString()
+		if err != nil {
+			continue // Пропускаем нестроковые ключи
+		}
+
+		// Конвертируем значение в go типы
+		goValue, err := r.nodeToGoValue(value)
+		if err != nil {
+			continue // Пропускаем проблемные значения
+		}
+
+		result[keyStr] = goValue
+	}
+
+	return result, nil
+}
+
+// nodeToGoValue конвертирует IPLD Node в Go значение
+func (r *Repository) nodeToGoValue(node datamodel.Node) (interface{}, error) {
+	switch node.Kind() {
+	case datamodel.Kind_String:
+		return node.AsString()
+	case datamodel.Kind_Bool:
+		return node.AsBool()
+	case datamodel.Kind_Int:
+		return node.AsInt()
+	case datamodel.Kind_Float:
+		return node.AsFloat()
+	case datamodel.Kind_List:
+		var result []interface{}
+		iterator := node.ListIterator()
+		for !iterator.Done() {
+			_, value, err := iterator.Next()
+			if err != nil {
+				return nil, err
+			}
+			goValue, err := r.nodeToGoValue(value)
+			if err != nil {
+				continue
+			}
+			result = append(result, goValue)
+		}
+		return result, nil
+	case datamodel.Kind_Map:
+		result := make(map[string]interface{})
+		iterator := node.MapIterator()
+		for !iterator.Done() {
+			key, value, err := iterator.Next()
+			if err != nil {
+				return nil, err
+			}
+			keyStr, err := key.AsString()
+			if err != nil {
+				continue
+			}
+			goValue, err := r.nodeToGoValue(value)
+			if err != nil {
+				continue
+			}
+			result[keyStr] = goValue
+		}
+		return result, nil
+	default:
+		return fmt.Sprintf("%v", node), nil
+	}
+}
+
+// generateSearchText создает текст для полнотекстового поиска из данных записи
+func (r *Repository) generateSearchText(data map[string]interface{}) string {
+	var parts []string
+
+	// Обходим все поля и собираем текстовые значения
+	for key, value := range data {
+		parts = append(parts, key) // Добавляем имя поля
+
+		switch v := value.(type) {
+		case string:
+			parts = append(parts, v)
+		case []interface{}:
+			for _, item := range v {
+				if str, ok := item.(string); ok {
+					parts = append(parts, str)
+				}
+			}
+		case map[string]interface{}:
+			// Рекурсивно обрабатываем вложенные объекты
+			for _, nested := range v {
+				if str, ok := nested.(string); ok {
+					parts = append(parts, str)
+				}
+			}
+		}
+	}
+
+	return strings.Join(parts, " ")
+}
+
+// inferRecordType определяет тип записи на основе коллекции и данных
+func (r *Repository) inferRecordType(collection string, data map[string]interface{}) string {
+	// Пытаемся определить тип из поля $type
+	if recordType, exists := data["$type"]; exists {
+		if typeStr, ok := recordType.(string); ok {
+			return typeStr
+		}
+	}
+
+	// Определяем тип на основе имени коллекции
+	switch collection {
+	case "posts", "app.bsky.feed.post":
+		return "post"
+	case "follows", "app.bsky.graph.follow":
+		return "follow"
+	case "likes", "app.bsky.feed.like":
+		return "like"
+	case "profiles", "app.bsky.actor.profile":
+		return "profile"
+	default:
+		return "record"
+	}
 }

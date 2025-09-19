@@ -128,6 +128,7 @@ func setupStorage() (uesDatastore.Datastore, *repository.Repository, func(), err
 
 	// Пытаемся загрузить последний коммит из специального ключа
 	ctx := context.Background()
+	
 	lastCommitKey := datastore.NewKey("/__ues_last_commit__")
 	if lastCommitCIDBytes, err := ds.Get(ctx, lastCommitKey); err == nil {
 		// Если есть сохраненный коммит, загружаем состояние репозитория
@@ -200,6 +201,9 @@ func handleRepoCommands(ctx context.Context, args []string) {
 }
 
 func handleCreateCollection(ctx context.Context, repo *repository.Repository, args []string) {
+
+	log.Fatal()
+
 	if len(args) != 1 {
 		fmt.Fprintf(os.Stderr, "Использование: repo create-collection <коллекция>\n")
 		os.Exit(1)
