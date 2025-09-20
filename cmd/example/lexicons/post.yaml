@@ -1,0 +1,15 @@
+id: com.example.post
+version: 1.0.0
+name: Blog Post
+description: Schema for blog posts with title, content and metadata
+status: active
+schema: |
+  type Post struct {
+    title String
+    content String
+    author String
+    tags [String]
+    published Bool
+    created_at optional String
+    updated_at optional String
+  }

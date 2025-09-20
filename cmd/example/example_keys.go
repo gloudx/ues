@@ -5,8 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"ues/blockstore"
-	ds "ues/datastore"
+	"path/filepath"
 	"ues/repository"
 
 	"github.com/ipfs/go-datastore"
@@ -23,23 +22,18 @@ func main() {
 	ctx := context.Background()
 
 	// Создаем временное хранилище
-	tempDir := "/tmp/ues_example"
+	tempDir := "./xxx"
 	err := os.MkdirAll(tempDir, 0755)
 	if err != nil {
 		log.Fatalf("Ошибка создания временной директории: %v", err)
 	}
 	defer os.RemoveAll(tempDir)
 
-	ds, err := ds.NewDatastorage(tempDir, nil)
-	if err != nil {
-		log.Fatalf("Ошибка создания datastore: %v", err)
-	}
-	defer ds.Close()
-
-	bs := blockstore.NewBlockstore(ds)
-
 	// Создаем новый репозиторий
-	repo := repository.New(bs)
+	repo, err := repository.NewRepository(tempDir, filepath.Join(tempDir, "data.db"), "./lexicons", "MAIN")
+	if err != nil {
+		log.Fatalf("Ошибка создания репозитория: %v", err)
+	}
 
 	fmt.Println("=== Начальное состояние репозитория ===")
 	fmt.Println("Коллекции:", repo.ListCollections())
@@ -129,7 +123,7 @@ func main() {
 
 	// Проверяем доступ к документу
 	fmt.Println("=== Проверка доступа к документу ===")
-	retrievedDoc, found, err := repo.GetRecord(ctx, "xxx", "ooo")
+	retrievedDoc, found, err := repo.GetRecord(ctx, "xxx", "/ooo")
 	if err != nil {
 		log.Fatalf("Ошибка получения документа: %v", err)
 	}
@@ -147,13 +141,14 @@ func main() {
 		fmt.Println("Документ не найден!")
 	}
 
-	keys, es, err := ds.Keys(context.Background(), datastore.RawKey(""))
+	keys, es, err := repo.Datastore().Iterator(ctx, datastore.NewKey("/"), false)
 	if err != nil {
 		log.Fatalf("Ошибка получения ключей из datastore: %v", err)
 	}
 	fmt.Println("Все ключи в datastore:")
 	for key := range keys {
-		fmt.Println(" -", key.String())
+		fmt.Println(" -", key.Key.String())
+		fmt.Println(" -", string(key.Value))
 	}
 	if es != nil {
 		fmt.Println("Ошибки при получении ключей:")
@@ -162,4 +157,5 @@ func main() {
 		}
 	}
 
+	repo.Close()
 }

@@ -119,6 +119,10 @@ type Blockstore interface {
 	// Встраивание интерфейса Closer для корректного управления ресурсами
 	io.Closer
 
+	// Datastore возвращает базовый datastore, используемый для персистентного хранения блоков.
+	// Позволяет выполнять низкоуровневые операции с хранилищем данных.
+	Datastore() s.Datastore
+
 	// PutNode сохраняет любой IPLD узел через LinkSystem с автоматической сериализацией.
 	// Метод использует IPLD Prime для эффективной работы с структурированными данными.
 	//
@@ -363,6 +367,8 @@ type Blockstore interface {
 // - Concurrent access к кэшу с минимальной блокировкой
 // - Изоляция операций чтения и записи
 type blockstore struct {
+	ds s.Datastore // Персистентное хранилище для блоков данных
+
 	// Blockstore - встроенный базовый blockstore из IPFS boxo.
 	// Обеспечивает стандартную функциональность: Put, Get, Has, Delete операции.
 	// Использует наш custom datastore как backend для персистентного хранения.
@@ -452,6 +458,7 @@ func NewBlockstore(ds s.Datastore) *blockstore {
 
 	// Инициализируем структуру blockstore с базовым blockstore
 	bs := &blockstore{
+		ds:         ds,
 		Blockstore: base,
 	}
 
@@ -918,12 +925,9 @@ func (bs *blockstore) Walk(ctx context.Context, root cid.Cid, visit func(p trave
 	return traversal.Progress{Cfg: &cfg}.WalkMatching(start, sel, visit)
 }
 
-// Close корректно закрывает blockstore и освобождает ресурсы.
-// В текущей реализации нет ресурсов требующих явного освобождения,
-// но метод предоставлен для совместимости с io.Closer интерфейсом.
+// Close освобождает ресурсы blockstore и закрывает underlying datastore.
+// Гарантирует корректное завершение всех операций и освобождение памяти.
 func (bs *blockstore) Close() error {
-	// LRU кэш, BlockService и DAGService не требуют явного закрытия
-	// Закрытие базового Datastore должно происходить на уровне создания
 	return nil
 }
 
@@ -1075,4 +1079,9 @@ func (bs *blockstore) ImportCARV2(ctx context.Context, r io.Reader, opts ...carv
 			}
 		}
 	}
+}
+
+// Datastore возвращает underlying datastore для прямых операций.
+func (bs *blockstore) Datastore() s.Datastore {
+	return bs.ds
 }

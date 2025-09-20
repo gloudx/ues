@@ -16,6 +16,7 @@ import (
 	"ues/sqliteindexer"
 
 	"github.com/ipfs/go-cid"
+	badger4 "github.com/ipfs/go-ds-badger4"
 	"github.com/ipld/go-ipld-prime/datamodel"
 )
 
@@ -51,9 +52,16 @@ type Repository struct {
 // Возвращает:
 //   - *Repository: новый экземпляр репозитория с полным функционалом
 //   - error: ошибка инициализации компонентов
-func NewWithFullFeatures(bs blockstore.Blockstore, ds datastore.Datastore, sqliteDBPath, lexiconPath, repoID string) (*Repository, error) {
+func NewRepository(dataPath, sqliteDBPath, lexiconPath, repoID string) (*Repository, error) {
 
 	ctx := context.Background()
+
+	ds, err := datastore.NewDatastorage(dataPath, &badger4.DefaultOptions)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create datastore: %w", err)
+	}
+
+	bs := blockstore.NewBlockstore(ds)
 
 	hStorage := headstorage.NewHeadStorage(ds)
 	state, err := hStorage.LoadHead(ctx, repoID)
@@ -156,6 +164,10 @@ func (r *Repository) PutRecord(ctx context.Context, collection, rkey string, nod
 			// MST индекс уже обновлен и это основной механизм
 			fmt.Printf("Warning: SQLite indexing failed for %s/%s: %v\n", collection, rkey, err)
 		}
+	}
+
+	if err := r.Commit(ctx); err != nil {
+		return cid.Undef, fmt.Errorf("commit after put record: %w", err)
 	}
 
 	// Успешно сохранили и проиндексировали запись
@@ -1013,4 +1025,69 @@ func (r *Repository) ExportCollectionCAR(ctx context.Context, collection string,
 	// Используем blockstore для создания CARv2 архива, начиная с корневого CID
 	// и следуя всем ссылкам согласно селектору
 	return r.bs.ExportCARV2(ctx, root, selectorNode, w)
+}
+
+// Close безопасно закрывает репозиторий, освобождая ресурсы.
+// Этот метод должен быть вызван, когда репозиторий больше не нужен,
+// чтобы гарантировать корректное завершение всех фоновых операций,
+// сохранение данных и освобождение занятых ресурсов.
+//
+// Возвращает:
+//   - error: ошибка закрытия, если операция не удалась
+//
+// Поведение:
+// - Закрывает все открытые соединения с blockstore
+// - Завершает работу индекса (MST) и сохраняет изменения
+// - Закрывает SQLite индексер, если он был инициализирован
+// - После вызова Close репозиторий становится недоступен для дальнейших операций
+//
+// Использование:
+//
+//	repo, err := OpenRepository(...)
+//	if err != nil {
+//	    log.Fatalf("failed to open repository: %v", err)
+//	}
+//	defer func() {
+//	    if err := repo.Close(); err != nil {
+//	        log.Printf("failed to close repository: %v", err)
+//	    }
+//	}()
+//
+//	// работа с репозиторием
+//
+// Производительность: операция может занять некоторое время в зависимости от
+// количества несохраненных изменений и состояния индекса
+func (r *Repository) Close() error {
+	var firstErr error
+
+	// Закрываем SQLite индексер, если он был инициализирован
+	if r.sqliteIndex != nil {
+		if err := r.sqliteIndex.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("failed to close SQLite indexer: %w", err)
+		}
+		r.sqliteIndex = nil
+	}
+
+	// Закрываем индекс MST, сохраняя все изменения
+	if r.index != nil {
+		if err := r.index.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("failed to close index: %w", err)
+		}
+		r.index = nil
+	}
+
+	// Закрываем blockstore, освобождая все связанные ресурсы
+	if r.bs != nil {
+		if err := r.bs.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("failed to close blockstore: %w", err)
+		}
+		r.bs = nil
+	}
+
+	return firstErr
+}
+
+// Datastore возвращает datastore, используемый blockstore репозитория.
+func (r *Repository) Datastore() datastore.Datastore {
+	return r.bs.Datastore()
 }
