@@ -44,13 +44,13 @@ import (
 	carv2 "github.com/ipld/go-car/v2"
 
 	// IPLD Prime - современная реализация IPLD с улучшенной производительностью
-	"github.com/ipld/go-ipld-prime"                                 // Основные типы и интерфейсы IPLD
-	"github.com/ipld/go-ipld-prime/datamodel"                       // Модель данных IPLD
-	"github.com/ipld/go-ipld-prime/linking"                         // Система связывания узлов через ссылки
-	cidlink "github.com/ipld/go-ipld-prime/linking/cid"             // CID-based linking
-	"github.com/ipld/go-ipld-prime/node/basicnode"                  // Базовые узлы данных
-	bindnode "github.com/ipld/go-ipld-prime/node/bindnode"          // Привязка Go типов к IPLD
-	"github.com/ipld/go-ipld-prime/schema"                          // Схемы данных IPLD
+	"github.com/ipld/go-ipld-prime"                     // Основные типы и интерфейсы IPLD
+	"github.com/ipld/go-ipld-prime/datamodel"           // Модель данных IPLD
+	"github.com/ipld/go-ipld-prime/linking"             // Система связывания узлов через ссылки
+	cidlink "github.com/ipld/go-ipld-prime/linking/cid" // CID-based linking
+	"github.com/ipld/go-ipld-prime/node/basicnode"      // Базовые узлы данных
+	// Привязка Go типов к IPLD
+	// Схемы данных IPLD
 	"github.com/ipld/go-ipld-prime/storage/bsrvadapter"             // Адаптер blockservice для IPLD
 	traversal "github.com/ipld/go-ipld-prime/traversal"             // Обход графов данных
 	selector "github.com/ipld/go-ipld-prime/traversal/selector"     // Селекторы для фильтрации
@@ -924,48 +924,6 @@ func (bs *blockstore) Close() error {
 	// LRU кэш, BlockService и DAGService не требуют явного закрытия
 	// Закрытие базового Datastore должно происходить на уровне создания
 	return nil
-}
-
-// PutStruct сохраняет Go структуру как IPLD узел с type binding.
-// Использует bindnode для автоматического преобразования Go типов в IPLD datamodel
-// с поддержкой schema validation и type safety.
-//
-// Параметры:
-//   - ctx: контекст операции
-//   - bs: blockstore для сохранения
-//   - v: указатель на Go структуру для сериализации
-//   - ts: type system с определением схем данных
-//   - typ: schema type для валидации и структурирования
-//   - lp: link prototype для настройки CID параметров
-func PutStruct[T any](ctx context.Context, bs *blockstore, v *T, ts *schema.TypeSystem, typ schema.Type, lp cidlink.LinkPrototype) (cid.Cid, error) {
-	// Оборачиваем Go структуру в IPLD узел через bindnode
-	n := bindnode.Wrap(v, typ)
-	// Сохраняем узел через стандартный PutNode
-	return bs.PutNode(ctx, n)
-}
-
-// GetStruct загружает IPLD узел и десериализует в Go структуру.
-// Обеспечивает type-safe доступ к структурированным данным с автоматической
-// десериализацией и валидацией схемы данных.
-func GetStruct[T any](bs *blockstore, ctx context.Context, c cid.Cid, ts *schema.TypeSystem, typ schema.Type) (*T, error) {
-	if bs.lsys == nil {
-		return nil, errors.New("link system is nil")
-	}
-	var out *T
-	var ok bool
-	lnk := cidlink.Link{Cid: c}
-	// Загружаем узел с bindnode прототипом для type binding
-	n, err := bs.lsys.Load(ipld.LinkContext{Ctx: ctx}, lnk, bindnode.Prototype(out, typ))
-	if err != nil {
-		return nil, err
-	}
-	// Извлекаем Go структуру из IPLD узла
-	w := bindnode.Unwrap(n)
-	out, ok = w.(*T)
-	if !ok {
-		return nil, errors.New("bindnode: type assertion failed")
-	}
-	return out, nil
 }
 
 // BuildSelectorExploreAll создает compiled selector для полного обхода графа.
