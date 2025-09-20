@@ -33,5 +33,4 @@ go.work.sum
 
 .gocache
 x
-data
-
+.data

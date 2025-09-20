@@ -285,7 +285,7 @@ func TestRepositoryWithoutSQLiteIndexer(t *testing.T) {
 	// Создаем обычный репозиторий БЕЗ SQLite индексера
 	// New() создает репозиторий только с MST индексом
 	// SQLite индексер не инициализируется и не доступен
-	repo := New(bs)
+	repo := New(bs, "", nil)
 
 	// === ПРОВЕРКА ОТСУТСТВИЯ SQLITE ИНДЕКСЕРА ===
 

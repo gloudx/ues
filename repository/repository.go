@@ -32,6 +32,8 @@ type Repository struct {
 	index       *Index
 	sqliteIndex *SQLiteIndexer   // SQLite индексер для быстрого поиска и запросов
 	lexicons    *LexiconRegistry // Реестр лексиконов для валидации схем
+	headStorage HeadStorage      // Persistent storage для HEAD состояния
+	repoID      string           // Уникальный идентификатор репозитория
 
 	mu   sync.RWMutex
 	head cid.Cid
@@ -43,20 +45,24 @@ type Repository struct {
 //
 // Параметры:
 //   - bs: блочное хранилище, которое будет использоваться для сохранения всех данных репозитория
+//   - repoID: уникальный идентификатор репозитория для persistent storage
+//   - headStorage: persistent storage для HEAD состояния
 //
 // Возвращает:
 //   - *Repository: новый экземпляр репозитория, готовый к использованию
 //
 // Использование:
 //
-//	repo := New(blockstore)
+//	repo := New(blockstore, "repo-001", headStorage)
 //	// Репозиторий готов для добавления записей и создания коммитов
-func New(bs blockstore.Blockstore) *Repository {
+func New(bs blockstore.Blockstore, repoID string, headStorage HeadStorage) *Repository {
 	return &Repository{
 		bs:          bs,
 		index:       NewIndex(bs),
 		sqliteIndex: nil, // SQLite индексер отключен по умолчанию
 		lexicons:    nil, // Лексиконы отключены по умолчанию
+		headStorage: headStorage,
+		repoID:      repoID,
 	}
 }
 
@@ -162,6 +168,12 @@ func (r *Repository) LoadHead(ctx context.Context, head cid.Cid) error {
 		r.prev = cid.Undef
 		// Освобождаем блокировку после обновления состояния
 		r.mu.Unlock()
+
+		// Сохраняем новое состояние в persistent storage
+		if err := r.saveHeadState(ctx); err != nil {
+			return fmt.Errorf("failed to save head state: %w", err)
+		}
+
 		// Загружаем пустой индекс в репозиторий
 		// index.Load(cid.Undef) создает новый пустой индекс
 		return r.index.Load(ctx, cid.Undef)
@@ -209,9 +221,47 @@ func (r *Repository) LoadHead(ctx context.Context, head cid.Cid) error {
 	// Освобождаем блокировку после успешного обновления состояния
 	r.mu.Unlock()
 
+	// Сохраняем новое состояние в persistent storage
+	if err := r.saveHeadState(ctx); err != nil {
+		return fmt.Errorf("failed to save head state: %w", err)
+	}
+
 	// Загрузка завершена успешно, репозиторий готов к работе
 	// Возвращаем nil, сигнализируя об отсутствии ошибок
 	return nil
+}
+
+// LoadHeadFromStorage автоматически восстанавливает состояние репозитория из persistent storage
+func (r *Repository) LoadHeadFromStorage(ctx context.Context) error {
+	if r.headStorage == nil {
+		return fmt.Errorf("head storage is not configured")
+	}
+
+	state, err := r.headStorage.LoadHead(ctx, r.repoID)
+	if err != nil {
+		return fmt.Errorf("failed to load head from storage: %w", err)
+	}
+
+	return r.LoadHead(ctx, state.Head)
+}
+
+// saveHeadState сохраняет текущее состояние в persistent storage
+func (r *Repository) saveHeadState(ctx context.Context) error {
+	if r.headStorage == nil {
+		return nil // Если storage не настроен, просто пропускаем
+	}
+
+	r.mu.RLock()
+	state := RepositoryState{
+		Head:      r.head,
+		Prev:      r.prev,
+		RootIndex: r.index.Root(),
+		Version:   1,
+		RepoID:    r.repoID,
+	}
+	r.mu.RUnlock()
+
+	return r.headStorage.SaveHead(ctx, r.repoID, state)
 }
 
 // PutRecord сохраняет узел записи в блочном хранилище и индексирует его под указанным collection/rkey.
@@ -527,6 +577,13 @@ func (r *Repository) Commit(ctx context.Context) (cid.Cid, error) {
 	// Теперь репозиторий указывает на новое состояние
 	r.head = headCID
 	r.mu.Unlock()
+
+	// Сохраняем новое состояние в persistent storage
+	if err := r.saveHeadState(ctx); err != nil {
+		// Если не удается сохранить состояние, логируем ошибку но не прерываем операцию
+		// Коммит уже создан и сохранен в blockstore
+		fmt.Printf("Warning: failed to save head state: %v\n", err)
+	}
 
 	// Коммит успешно создан и сохранен
 	// Возвращаем CID нового коммита для использования клиентским кодом

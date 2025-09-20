@@ -33,7 +33,7 @@ func setupTestRepo(t *testing.T) (*Repository, blockstore.Blockstore, func()) {
 	bs := blockstore.NewBlockstore(ds)
 
 	// Создаем репозиторий
-	repo := New(bs)
+	repo := New(bs, "", nil)
 
 	// Функция очистки
 	cleanup := func() {
@@ -314,7 +314,7 @@ func TestRepository_LoadHead_WithCommit(t *testing.T) {
 	require.NoError(t, err)
 
 	// Создаем новый репозиторий и загружаем состояние
-	repo2 := New(bs)
+	repo2 := New(bs, "", nil)
 	err = repo2.LoadHead(ctx, commitCID)
 	require.NoError(t, err)
 
