@@ -24,6 +24,31 @@ import (
 	"gopkg.in/yaml.v3"                     // YAML парсер для конфигурационных файлов
 )
 
+// SchemaStatus определяет статус лексикона в жизненном цикле
+//
+// НАЗНАЧЕНИЕ:
+// Управление жизненным циклом лексиконов от разработки до архивирования.
+// Позволяет контролировать использование схем в продакшене и планировать их эволюцию.
+//
+// ПЕРЕХОДЫ СТАТУСОВ:
+// draft -> active: после завершения разработки и тестирования
+// active -> deprecated: когда появляется новая версия или схема устаревает
+// deprecated -> archived: когда схема больше не поддерживается
+//
+// ПРАВИЛА ИСПОЛЬЗОВАНИЯ:
+// - DRAFT: только для разработки и тестирования
+// - ACTIVE: разрешено использование в продакшене
+// - DEPRECATED: работает, но выдает предупреждения
+// - ARCHIVED: блокируется создание новых записей
+type SchemaStatus string
+
+const (
+	SchemaStatusDraft      SchemaStatus = "draft"      // Черновик - схема в разработке, не готова для продакшена
+	SchemaStatusActive     SchemaStatus = "active"     // Активная - готова к полноценному использованию в продакшене
+	SchemaStatusDeprecated SchemaStatus = "deprecated" // Устаревшая - работает, но не рекомендуется для новых проектов
+	SchemaStatusArchived   SchemaStatus = "archived"   // Архивная - не используется, сохранена только для совместимости
+)
+
 // LexiconDefinition представляет определение схемы в YAML формате.
 // Это основная структура данных для хранения метаинформации о схеме
 // и самого определения схемы в текстовом виде.
@@ -36,12 +61,12 @@ import (
 // status: состояние схемы (active/draft/deprecated)
 // schema: текст IPLD схемы в DSL формате
 type LexiconDefinition struct {
-	ID          string `yaml:"id"`          // Уникальный идентификатор схемы
-	Version     string `yaml:"version"`     // Версия схемы (семантическое версионирование)
-	Name        string `yaml:"name"`        // Человеко-читаемое название
-	Description string `yaml:"description"` // Подробное описание схемы
-	Status      string `yaml:"status"`      // Статус: active, draft, deprecated
-	Schema      string `yaml:"schema"`      // IPLD схема в DSL формате
+	ID          string       `yaml:"id"`          // Уникальный идентификатор схемы
+	Version     string       `yaml:"version"`     // Версия схемы (семантическое версионирование)
+	Name        string       `yaml:"name"`        // Человеко-читаемое название
+	Description string       `yaml:"description"` // Подробное описание схемы
+	Status      SchemaStatus `yaml:"status"`      // Статус: active, draft, deprecated
+	Schema      string       `yaml:"schema"`      // IPLD схема в DSL формате
 }
 
 // Registry управляет лексиконами из файловой системы.

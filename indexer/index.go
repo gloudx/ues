@@ -1,4 +1,4 @@
-package repository
+package indexer
 
 import (
 	"context"
@@ -58,10 +58,10 @@ type Index struct {
 // - roots: пустая карта коллекций
 // - root: cid.Undef (индекс не материализован)
 // - готов к операциям создания коллекций и добавления записей
-func NewIndex(bs blockstore.Blockstore) *Index {
+func NewIndex(bs blockstore.Blockstore, root cid.Cid) *Index {
 	return &Index{
 		bs:    bs,
-		root:  cid.Undef,
+		root:  root,
 		roots: make(map[string]cid.Cid),
 	}
 }
@@ -95,31 +95,27 @@ func NewIndex(bs blockstore.Blockstore) *Index {
 // 6. Обновление внутренней карты roots
 //
 // Потокобезопасность: метод блокирует индекс на запись на время загрузки
-func (i *Index) Load(ctx context.Context, root cid.Cid) error {
+func (i *Index) Load(ctx context.Context) error {
 	// Блокируем индекс для записи на время загрузки
 	// Это гарантирует атомарность операции восстановления состояния
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
-	// Устанавливаем новый корневой CID индекса
-	// Это может быть cid.Undef для пустого индекса
-	i.root = root
+	// === Обработка пустого индекса ===
+	// Если root не определен, оставляем индекс в пустом состоянии
+	// Это нормальное состояние для нового репозитория без коллекций
+	if !i.root.Defined() {
+		return nil
+	}
 
 	// Сбрасываем карту корней коллекций для чистого состояния
 	// Это важно при повторной загрузке поверх существующего состояния
 	i.roots = make(map[string]cid.Cid)
 
-	// === Обработка пустого индекса ===
-	// Если root не определен, оставляем индекс в пустом состоянии
-	// Это нормальное состояние для нового репозитория без коллекций
-	if !root.Defined() {
-		return nil
-	}
-
 	// === Загрузка узла индекса из blockstore ===
 	// Получаем IPLD узел индекса по его CID
 	// Узел должен быть картой: collection_name -> MST_root_link
-	dm, err := i.bs.GetNode(ctx, root)
+	dm, err := i.bs.GetNode(ctx, i.root)
 	if err != nil {
 		// Если узел не найден или не может быть десериализован,
 		// возвращаем ошибку с контекстом операции

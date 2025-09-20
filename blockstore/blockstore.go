@@ -49,6 +49,7 @@ import (
 	"github.com/ipld/go-ipld-prime/linking"             // Система связывания узлов через ссылки
 	cidlink "github.com/ipld/go-ipld-prime/linking/cid" // CID-based linking
 	"github.com/ipld/go-ipld-prime/node/basicnode"      // Базовые узлы данных
+
 	// Привязка Go типов к IPLD
 	// Схемы данных IPLD
 	"github.com/ipld/go-ipld-prime/storage/bsrvadapter"             // Адаптер blockservice для IPLD

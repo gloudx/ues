@@ -3,16 +3,20 @@ package repository
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
+	"ues/blockstore"
+	"ues/datastore"
+	"ues/headstorage"
+	"ues/indexer"
+	"ues/lexicon"
+	"ues/mst"
+	"ues/sqliteindexer"
 
 	"github.com/ipfs/go-cid"
 	"github.com/ipld/go-ipld-prime/datamodel"
-	cidlink "github.com/ipld/go-ipld-prime/linking/cid"
-	"github.com/ipld/go-ipld-prime/node/basicnode"
-
-	"ues/blockstore"
 )
 
 // Repository управляет контент-адресованной коллекцией записей, сгруппированных по имени коллекции.
@@ -29,82 +33,12 @@ import (
 //   - mu: мьютекс для обеспечения потокобезопасности
 type Repository struct {
 	bs          blockstore.Blockstore
-	index       *Index
-	sqliteIndex *SQLiteIndexer   // SQLite индексер для быстрого поиска и запросов
-	lexicons    *LexiconRegistry // Реестр лексиконов для валидации схем
-	headStorage HeadStorage      // Persistent storage для HEAD состояния
-	repoID      string           // Уникальный идентификатор репозитория
-
-	mu   sync.RWMutex
-	head cid.Cid
-	prev cid.Cid
-}
-
-// New создает новый пустой репозиторий с собственным индексом, поддерживаемым указанным blockstore.
-// Репозиторий инициализируется в пустом состоянии без коммитов и записей.
-//
-// Параметры:
-//   - bs: блочное хранилище, которое будет использоваться для сохранения всех данных репозитория
-//   - repoID: уникальный идентификатор репозитория для persistent storage
-//   - headStorage: persistent storage для HEAD состояния
-//
-// Возвращает:
-//   - *Repository: новый экземпляр репозитория, готовый к использованию
-//
-// Использование:
-//
-//	repo := New(blockstore, "repo-001", headStorage)
-//	// Репозиторий готов для добавления записей и создания коммитов
-func New(bs blockstore.Blockstore, repoID string, headStorage HeadStorage) *Repository {
-	return &Repository{
-		bs:          bs,
-		index:       NewIndex(bs),
-		sqliteIndex: nil, // SQLite индексер отключен по умолчанию
-		lexicons:    nil, // Лексиконы отключены по умолчанию
-		headStorage: headStorage,
-		repoID:      repoID,
-	}
-}
-
-// NewWithLexicons создает новый репозиторий с поддержкой валидации через лексиконы
-//
-// Параметры:
-//   - bs: блочное хранилище для сохранения IPLD данных
-//   - lexicons: реестр лексиконов для валидации схем данных
-//
-// Возвращает:
-//   - *Repository: новый экземпляр репозитория с поддержкой лексиконов
-func NewWithLexicons(bs blockstore.Blockstore, lexicons *LexiconRegistry) *Repository {
-	return &Repository{
-		bs:          bs,
-		index:       NewIndex(bs),
-		sqliteIndex: nil,
-		lexicons:    lexicons,
-	}
-}
-
-// NewWithSQLiteIndex создает новый репозиторий с поддержкой SQLite индексирования
-// для быстрого поиска и запросов по записям.
-//
-// Параметры:
-//   - bs: блочное хранилище для сохранения IPLD данных
-//   - sqliteDBPath: путь к файлу SQLite базы данных для индексирования
-//
-// Возвращает:
-//   - *Repository: новый экземпляр репозитория с SQLite индексером
-//   - error: ошибка инициализации SQLite индексера
-func NewWithSQLiteIndex(bs blockstore.Blockstore, sqliteDBPath string) (*Repository, error) {
-	sqliteIndex, err := NewSQLiteIndexer(sqliteDBPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create SQLite indexer: %w", err)
-	}
-
-	return &Repository{
-		bs:          bs,
-		index:       NewIndex(bs),
-		sqliteIndex: sqliteIndex,
-		lexicons:    nil, // Лексиконы отключены по умолчанию
-	}, nil
+	index       *indexer.Index
+	sqliteIndex *sqliteindexer.SimpleSQLiteIndexer // SQLite индексер для быстрого поиска и запросов
+	lexicon     *lexicon.Registry                  // Реестр лексиконов для валидации схем
+	headStorage headstorage.HeadStorage            // Persistent storage для HEAD состояния
+	headstorage.RepositoryState
+	mu sync.RWMutex
 }
 
 // NewWithFullFeatures создает репозиторий с поддержкой SQLite индексирования и лексиконов
@@ -117,151 +51,52 @@ func NewWithSQLiteIndex(bs blockstore.Blockstore, sqliteDBPath string) (*Reposit
 // Возвращает:
 //   - *Repository: новый экземпляр репозитория с полным функционалом
 //   - error: ошибка инициализации компонентов
-func NewWithFullFeatures(bs blockstore.Blockstore, sqliteDBPath string, lexicons *LexiconRegistry) (*Repository, error) {
-	sqliteIndex, err := NewSQLiteIndexer(sqliteDBPath)
+func NewWithFullFeatures(bs blockstore.Blockstore, ds datastore.Datastore, sqliteDBPath, lexiconPath, repoID string) (*Repository, error) {
+
+	ctx := context.Background()
+
+	hStorage := headstorage.NewHeadStorage(ds)
+	state, err := hStorage.LoadHead(ctx, repoID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load head state: %w", err)
+	}
+
+	index := indexer.NewIndex(bs, state.Head)
+
+	sqliteIndex, err := sqliteindexer.NewSimpleSQLiteIndexer(sqliteDBPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create SQLite indexer: %w", err)
 	}
 
+	lex := lexicon.NewRegistry(lexiconPath)
+
 	return &Repository{
-		bs:          bs,
-		index:       NewIndex(bs),
-		sqliteIndex: sqliteIndex,
-		lexicons:    lexicons,
+		bs:              bs,
+		index:           index,
+		sqliteIndex:     sqliteIndex,
+		lexicon:         lex,
+		headStorage:     hStorage,
+		RepositoryState: state,
 	}, nil
 }
 
-// LoadHead загружает состояние репозитория из существующего коммита по его CID.
-// Этот метод восстанавливает полное состояние репозитория, включая индекс и внутренние указатели,
-// из сохраненного ранее коммита. Используется для открытия существующего репозитория или
-// восстановления состояния после перезапуска приложения.
-//
-// Параметры:
-//   - ctx: контекст для отмены операции и передачи значений
-//   - head: CID коммита, который должен стать новым HEAD репозитория.
-//     Если передан cid.Undef, репозиторий будет сброшен в пустое состояние
-//
-// Возвращает:
-//   - error: ошибка загрузки, если коммит не найден или имеет некорректную структуру
-//
-// Процесс загрузки:
-// 1. Проверка валидности CID коммита
-// 2. Загрузка узла коммита из blockstore
-// 3. Парсинг структуры коммита для извлечения root и prev CID
-// 4. Загрузка индекса из root CID
-// 5. Обновление внутреннего состояния репозитория (head, prev)
-//
-// Потокобезопасность: метод использует мьютекс для защиты внутреннего состояния
-func (r *Repository) LoadHead(ctx context.Context, head cid.Cid) error {
-	// === Обработка случая пустого репозитория ===
-	// Проверяем, передан ли валидный CID для загрузки
-	// cid.Undef означает, что нужно сбросить репозиторий в пустое состояние
-	if !head.Defined() {
-		// Блокируем доступ к полям репозитория для записи
-		// Это гарантирует атомарность операции сброса состояния
-		r.mu.Lock()
-		// Сбрасываем указатель на текущий HEAD коммит
-		// cid.Undef означает отсутствие коммитов в репозитории
-		r.head = cid.Undef
-		// Сбрасываем указатель на предыдущий коммит
-		// Для пустого репозитория предыдущего коммита не существует
-		r.prev = cid.Undef
-		// Освобождаем блокировку после обновления состояния
-		r.mu.Unlock()
-
-		// Сохраняем новое состояние в persistent storage
-		if err := r.saveHeadState(ctx); err != nil {
-			return fmt.Errorf("failed to save head state: %w", err)
-		}
-
-		// Загружаем пустой индекс в репозиторий
-		// index.Load(cid.Undef) создает новый пустой индекс
-		return r.index.Load(ctx, cid.Undef)
-	}
-
-	// === Загрузка узла коммита из blockstore ===
-	// Получаем IPLD узел коммита по его CID из блочного хранилища
-	// blockstore.GetNode десериализует данные блока в структуру узла
-	node, err := r.bs.GetNode(ctx, head)
-	if err != nil {
-		// Если коммит не найден в blockstore или произошла ошибка десериализации,
-		// возвращаем обернутую ошибку с контекстом операции
-		return fmt.Errorf("load commit node: %w", err)
-	}
-
-	// === Парсинг структуры коммита ===
-	// Извлекаем из узла коммита CID корневого узла индекса и CID предыдущего коммита
-	// parseCommit разбирает структуру коммита и валидирует её корректность
-	rootCID, prevCID, err := parseCommit(node)
-	if err != nil {
-		// Если структура коммита некорректна (отсутствуют обязательные поля,
-		// неправильные типы данных и т.д.), прерываем загрузку
-		return err
-	}
-
-	// === Загрузка индекса репозитория ===
-	// Восстанавливаем состояние индекса из корневого CID, извлеченного из коммита
-	// index.Load загружает MST-структуру индекса и все связанные данные
-	if err := r.index.Load(ctx, rootCID); err != nil {
-		// Если индекс не удается загрузить (поврежденные данные, отсутствующие блоки),
-		// операция загрузки считается неуспешной
-		return err
-	}
-
-	// === Обновление внутреннего состояния репозитория ===
-	// Блокируем доступ к полям репозитория для записи
-	// Это обеспечивает атомарность обновления состояния и потокобезопасность
-	r.mu.Lock()
-	// Устанавливаем новый HEAD репозитория на загруженный коммит
-	// Теперь этот коммит считается текущим состоянием репозитория
-	r.head = head
-	// Сохраняем CID предыдущего коммита для поддержания цепочки коммитов
-	// Это необходимо для создания следующих коммитов и отслеживания истории
-	r.prev = prevCID
-	// Освобождаем блокировку после успешного обновления состояния
-	r.mu.Unlock()
-
-	// Сохраняем новое состояние в persistent storage
-	if err := r.saveHeadState(ctx); err != nil {
-		return fmt.Errorf("failed to save head state: %w", err)
-	}
-
-	// Загрузка завершена успешно, репозиторий готов к работе
-	// Возвращаем nil, сигнализируя об отсутствии ошибок
-	return nil
-}
-
-// LoadHeadFromStorage автоматически восстанавливает состояние репозитория из persistent storage
-func (r *Repository) LoadHeadFromStorage(ctx context.Context) error {
-	if r.headStorage == nil {
-		return fmt.Errorf("head storage is not configured")
-	}
-
-	state, err := r.headStorage.LoadHead(ctx, r.repoID)
-	if err != nil {
-		return fmt.Errorf("failed to load head from storage: %w", err)
-	}
-
-	return r.LoadHead(ctx, state.Head)
-}
-
-// saveHeadState сохраняет текущее состояние в persistent storage
-func (r *Repository) saveHeadState(ctx context.Context) error {
+// Commit сохраняет текущее состояние репозитория в headStorage.
+func (r *Repository) Commit(ctx context.Context) error {
 	if r.headStorage == nil {
 		return nil // Если storage не настроен, просто пропускаем
 	}
 
 	r.mu.RLock()
-	state := RepositoryState{
-		Head:      r.head,
-		Prev:      r.prev,
+	state := headstorage.RepositoryState{
+		Head:      r.Head,
+		Prev:      r.Prev,
 		RootIndex: r.index.Root(),
 		Version:   1,
-		RepoID:    r.repoID,
+		RepoID:    r.RepoID,
 	}
 	r.mu.RUnlock()
 
-	return r.headStorage.SaveHead(ctx, r.repoID, state)
+	return r.headStorage.SaveHead(ctx, r.RepoID, state)
 }
 
 // PutRecord сохраняет узел записи в блочном хранилище и индексирует его под указанным collection/rkey.
@@ -285,9 +120,10 @@ func (r *Repository) saveHeadState(ctx context.Context) error {
 //
 // Важно: изменения индекса остаются в памяти до вызова Commit()
 func (r *Repository) PutRecord(ctx context.Context, collection, rkey string, node datamodel.Node) (cid.Cid, error) {
+
 	// === ВАЛИДАЦИЯ ЧЕРЕЗ ЛЕКСИКОНЫ ===
 	// Если лексиконы включены, валидируем данные против схемы коллекции
-	if r.lexicons != nil {
+	if r.lexicon != nil {
 		if err := r.validateRecordWithLexicon(ctx, collection, node); err != nil {
 			return cid.Undef, fmt.Errorf("lexicon validation failed for %s/%s: %w", collection, rkey, err)
 		}
@@ -327,6 +163,182 @@ func (r *Repository) PutRecord(ctx context.Context, collection, rkey string, nod
 	return valueCID, nil
 }
 
+// indexRecordInSQLite индексирует запись в SQLite для быстрого поиска
+func (r *Repository) indexRecordInSQLite(ctx context.Context, recordCID cid.Cid, collection, rkey string, node datamodel.Node) error {
+
+	// Извлекаем данные из IPLD узла
+	data, err := extractDataFromNode(node)
+	if err != nil {
+		return fmt.Errorf("failed to extract data from node: %w", err)
+	}
+
+	// Генерируем текст для полнотекстового поиска
+	searchText := generateSearchText(data)
+
+	// Создаем метаданные для индексирования
+	metadata := sqliteindexer.IndexMetadata{
+		Collection: collection,
+		RKey:       rkey,
+		RecordType: inferRecordType(collection, data),
+		Data:       data,
+		SearchText: searchText,
+		CreatedAt:  time.Now(),
+		UpdatedAt:  time.Now(),
+	}
+
+	return r.sqliteIndex.IndexRecord(ctx, recordCID, metadata)
+}
+
+// extractDataFromNode извлекает данные из IPLD узла в map[string]interface{}
+func extractDataFromNode(node datamodel.Node) (map[string]interface{}, error) {
+	result := make(map[string]interface{})
+
+	// Обходим все поля узла
+	iterator := node.MapIterator()
+
+	for !iterator.Done() {
+		key, value, err := iterator.Next()
+		if err != nil {
+			return nil, err
+		}
+
+		keyStr, err := key.AsString()
+		if err != nil {
+			continue // Пропускаем нестроковые ключи
+		}
+
+		// Конвертируем значение в go типы
+		goValue, err := nodeToGoValue(value)
+		if err != nil {
+			continue // Пропускаем проблемные значения
+		}
+
+		result[keyStr] = goValue
+	}
+
+	return result, nil
+}
+
+// nodeToGoValue конвертирует IPLD Node в Go значение
+func nodeToGoValue(node datamodel.Node) (interface{}, error) {
+
+	switch node.Kind() {
+	case datamodel.Kind_String:
+		return node.AsString()
+
+	case datamodel.Kind_Bool:
+		return node.AsBool()
+
+	case datamodel.Kind_Int:
+		return node.AsInt()
+
+	case datamodel.Kind_Float:
+		return node.AsFloat()
+
+	case datamodel.Kind_List:
+		var result []interface{}
+		iterator := node.ListIterator()
+		for !iterator.Done() {
+			_, value, err := iterator.Next()
+			if err != nil {
+				return nil, err
+			}
+			goValue, err := nodeToGoValue(value)
+			if err != nil {
+				continue
+			}
+			result = append(result, goValue)
+		}
+		return result, nil
+
+	case datamodel.Kind_Map:
+		result := make(map[string]interface{})
+		iterator := node.MapIterator()
+		for !iterator.Done() {
+			key, value, err := iterator.Next()
+			if err != nil {
+				return nil, err
+			}
+			keyStr, err := key.AsString()
+			if err != nil {
+				continue
+			}
+			goValue, err := nodeToGoValue(value)
+			if err != nil {
+				continue
+			}
+			result[keyStr] = goValue
+		}
+		return result, nil
+
+	default:
+		return fmt.Sprintf("%v", node), nil
+	}
+}
+
+// inferRecordType определяет тип записи на основе коллекции и данных
+func inferRecordType(collection string, data map[string]interface{}) string {
+
+	// Пытаемся определить тип из поля $type
+	if recordType, exists := data["$type"]; exists {
+		if typeStr, ok := recordType.(string); ok {
+			return typeStr
+		}
+	}
+
+	// Определяем тип на основе имени коллекции
+	switch collection {
+	case "posts", "app.bsky.feed.post":
+		return "post"
+
+	case "follows", "app.bsky.graph.follow":
+		return "follow"
+
+	case "likes", "app.bsky.feed.like":
+		return "like"
+
+	case "profiles", "app.bsky.actor.profile":
+		return "profile"
+
+	default:
+		return "record"
+	}
+}
+
+// generateSearchText создает текст для полнотекстового поиска из данных записи
+func generateSearchText(data map[string]interface{}) string {
+
+	var parts []string
+
+	// Обходим все поля и собираем текстовые значения
+	for key, value := range data {
+
+		parts = append(parts, key) // Добавляем имя поля
+
+		switch v := value.(type) {
+		case string:
+			parts = append(parts, v)
+
+		case []interface{}:
+			for _, item := range v {
+				if str, ok := item.(string); ok {
+					parts = append(parts, str)
+				}
+			}
+
+		case map[string]interface{}:
+			// Рекурсивно обрабатываем вложенные объекты
+			for _, nested := range v {
+				if str, ok := nested.(string); ok {
+					parts = append(parts, str)
+				}
+			}
+		}
+	}
+
+	return strings.Join(parts, " ")
+}
+
 // validateRecordWithLexicon валидирует IPLD узел против лексикона коллекции
 //
 // ЛОГИКА ВАЛИДАЦИИ:
@@ -343,13 +355,11 @@ func (r *Repository) PutRecord(ctx context.Context, collection, rkey string, nod
 // Возвращает:
 //   - error: ошибка валидации или nil при успехе
 func (r *Repository) validateRecordWithLexicon(ctx context.Context, collection string, node datamodel.Node) error {
-	// Конвертируем имя коллекции в LexiconID
-	// Соглашение: collection "posts" -> lexicon "com.example.posts.record"
-	// TODO: Это упрощенная схема, в реальности может быть более сложная логика
-	lexiconID := LexiconID(fmt.Sprintf("com.example.%s.record", collection))
+
+	lexiconID := inferLexiconID(collection)
 
 	// Получаем актуальную версию лексикона
-	definition, err := r.lexicons.GetLexicon(ctx, lexiconID, nil) // nil = последняя стабильная версия
+	definition, err := r.lexicon.GetSchema(lexiconID) // nil = последняя стабильная версия
 	if err != nil {
 		// Если лексикон не найден, это может быть:
 		// 1. Новая коллекция без определенной схемы (разрешаем)
@@ -362,20 +372,26 @@ func (r *Repository) validateRecordWithLexicon(ctx context.Context, collection s
 	}
 
 	// Проверяем статус лексикона
-	if definition.Status == SchemaStatusArchived {
+	if definition.Status == lexicon.SchemaStatusArchived {
 		return fmt.Errorf("lexicon %s is archived and cannot be used", lexiconID)
 	}
 
-	if definition.Status == SchemaStatusDeprecated && !r.lexicons.config.AllowDeprecated {
-		return fmt.Errorf("lexicon %s is deprecated and deprecated schemas are disabled", lexiconID)
+	if definition.Status == lexicon.SchemaStatusDeprecated {
+		return fmt.Errorf("lexicon %s is deprecated", lexiconID)
 	}
 
 	// Валидируем данные против лексикона
-	if err := r.lexicons.ValidateData(ctx, lexiconID, definition.Version, node); err != nil {
+	if err := r.lexicon.ValidateData(lexiconID, node); err != nil {
 		return fmt.Errorf("data validation failed: %w", err)
 	}
 
 	return nil
+}
+
+// inferRecordType определяет тип записи на основе коллекции и данных
+func inferLexiconID(collection string) string {
+	// return fmt.Sprintf("com.example.%s.record", collection)
+	return collection
 }
 
 // DeleteRecord удаляет mapping записи из индекса репозитория.
@@ -514,82 +530,6 @@ func (r *Repository) ListCollection(ctx context.Context, collection string) ([]c
 	return out, nil
 }
 
-// Commit сохраняет текущее состояние индекса как новый коммит и возвращает его CID.
-// Этот метод создает снимок текущего состояния репозитория, формируя новый коммит
-// в цепочке истории изменений. Коммит содержит ссылку на корневой узел индекса,
-// ссылку на предыдущий коммит и временную метку создания.
-//
-// Параметры:
-//   - ctx: контекст для отмены операции и передачи значений
-//
-// Возвращает:
-//   - cid.Cid: CID созданного коммита, который становится новым HEAD репозитория
-//   - error: ошибка создания коммита, если операция не удалась
-//
-// Процесс создания коммита:
-// 1. Сохранение текущего HEAD как предыдущего коммита
-// 2. Получение корневого CID текущего состояния индекса
-// 3. Создание узла коммита с root, prev и timestamp
-// 4. Сохранение узла коммита в blockstore
-// 5. Обновление внутреннего состояния (head, prev)
-//
-// Потокобезопасность: использует RLock для чтения и Lock для записи состояния
-// Атомарность: все изменения применяются только после успешного сохранения коммита
-func (r *Repository) Commit(ctx context.Context) (cid.Cid, error) {
-	// === Чтение текущего состояния репозитория ===
-	// Используем RLock для безопасного чтения текущего HEAD
-	// Несколько горутин могут одновременно читать head, но запись блокируется
-	r.mu.RLock()
-	// Сохраняем текущий HEAD как предыдущий коммит для нового коммита
-	// Это создает связь в цепочке коммитов: новый -> текущий -> предыдущий -> ...
-	prev := r.head
-	r.mu.RUnlock()
-
-	// === Создание узла коммита ===
-	// Строим IPLD узел коммита, содержащий:
-	// - root: CID корневого узла текущего индекса
-	// - prev: CID предыдущего коммита (или cid.Undef для первого коммита)
-	// - timestamp: текущее время создания коммита
-	commitNode, err := buildCommitNode(r.index.Root(), prev, time.Now())
-	if err != nil {
-		// Если не удается создать структуру коммита (ошибка сериализации IPLD),
-		// возвращаем неопределенный CID и ошибку
-		return cid.Undef, err
-	}
-
-	// === Сохранение коммита в blockstore ===
-	// Сериализуем и сохраняем узел коммита в блочном хранилище
-	// blockstore автоматически вычисляет CID коммита на основе его содержимого
-	headCID, err := r.bs.PutNode(ctx, commitNode)
-	if err != nil {
-		// Если не удается сохранить коммит (проблемы с blockstore),
-		// возвращаем ошибку с контекстом операции
-		return cid.Undef, fmt.Errorf("store commit node: %w", err)
-	}
-
-	// === Атомарное обновление состояния репозитория ===
-	// Блокируем репозиторий для записи для атомарного обновления состояния
-	r.mu.Lock()
-	// Обновляем prev на предыдущий HEAD (создание цепочки)
-	// Это значение будет использовано при создании следующего коммита
-	r.prev = prev
-	// Устанавливаем новый HEAD репозитория на только что созданный коммит
-	// Теперь репозиторий указывает на новое состояние
-	r.head = headCID
-	r.mu.Unlock()
-
-	// Сохраняем новое состояние в persistent storage
-	if err := r.saveHeadState(ctx); err != nil {
-		// Если не удается сохранить состояние, логируем ошибку но не прерываем операцию
-		// Коммит уже создан и сохранен в blockstore
-		fmt.Printf("Warning: failed to save head state: %v\n", err)
-	}
-
-	// Коммит успешно создан и сохранен
-	// Возвращаем CID нового коммита для использования клиентским кодом
-	return headCID, nil
-}
-
 // SearchRecords выполняет поиск записей через SQLite индексер (если включен)
 // Обеспечивает быстрый поиск с поддержкой фильтров, полнотекстового поиска и сортировки.
 //
@@ -600,7 +540,7 @@ func (r *Repository) Commit(ctx context.Context) (cid.Cid, error) {
 // Возвращает:
 //   - []SearchResult: результаты поиска с метаданными
 //   - error: ошибка выполнения поиска или отсутствие SQLite индексера
-func (r *Repository) SearchRecords(ctx context.Context, query SearchQuery) ([]SearchResult, error) {
+func (r *Repository) SearchRecords(ctx context.Context, query sqliteindexer.SearchQuery) ([]sqliteindexer.SearchResult, error) {
 	if r.sqliteIndex == nil {
 		return nil, fmt.Errorf("SQLite indexer is not enabled for this repository")
 	}
@@ -641,351 +581,436 @@ func (r *Repository) CloseSQLiteIndex() error {
 	return err
 }
 
-// buildCommitNode создает IPLD узел, представляющий коммит в репозитории.
-// Коммит содержит ссылку на корневой узел текущего состояния репозитория,
-// ссылку на предыдущий коммит (для создания цепочки коммитов) и временную метку.
+// CreateCollection создает новую пустую запись коллекции в репозитории.
+// Этот метод является обертокой вокруг index.CreateCollection, предоставляя
+// удобный API уровня репозитория для создания новых коллекций. После создания
+// коллекция готова для добавления записей через PutRecord.
 //
 // Параметры:
-//   - root: CID корневого узла индекса репозитория на момент коммита
-//   - prev: CID предыдущего коммита в цепочке (может быть неопределенным для первого коммита)
-//   - ts: временная метка создания коммита
+//   - ctx: контекст для отмены операции и передачи значений
+//   - name: имя новой коллекции (должно быть уникальным в рамках репозитория)
 //
 // Возвращает:
-//   - datamodel.Node: IPLD узел, представляющий структуру коммита
-//   - error: ошибка при создании узла
+//   - cid.Cid: CID материализованного узла индекса после создания коллекции
+//   - error: ошибка создания, если коллекция уже существует или операция не удалась
 //
-// Структура коммита в виде карты:
+// Поведение:
+// - Создает пустую коллекцию с неопределенным MST корнем (cid.Undef)
+// - Материализует обновленный индекс репозитория
+// - Возвращает ошибку, если коллекция с таким именем уже существует
 //
-//	{
-//	  "root": <ссылка на корневой CID>,
-//	  "prev": <ссылка на предыдущий коммит или null>,
-//	  "timestamp": <Unix временная метка в секундах>
+// Использование:
+//
+//	rootCID, err := repo.CreateCollection(ctx, "posts")
+//	if err != nil {
+//	    // обработка ошибки (например, коллекция уже существует)
 //	}
-func buildCommitNode(root cid.Cid, prev cid.Cid, ts time.Time) (datamodel.Node, error) {
-	// Создаем билдер для построения IPLD узла типа "карта" (map)
-	// Используем базовый прототип карты из библиотеки basicnode
-	builder := basicnode.Prototype.Map.NewBuilder()
-
-	// Начинаем сборку карты с 3 элементами: root, prev, timestamp
-	// Количество элементов указывается заранее для оптимизации памяти
-	ma, err := builder.BeginMap(3)
-	if err != nil {
-		return nil, err
-	}
-
-	// === Добавляем поле "root" ===
-	// Создаем новую запись в карте с ключом "root"
-	entry, err := ma.AssembleEntry("root")
-	if err != nil {
-		return nil, err
-	}
-	// Проверяем, определен ли корневой CID
-	if root.Defined() {
-		// Если корень определен, создаем ссылку на него
-		if err := entry.AssignLink(cidlink.Link{Cid: root}); err != nil {
-			return nil, err
-		}
-	} else {
-		// Если корень не определен (пустой репозиторий), устанавливаем null
-		if err := entry.AssignNull(); err != nil {
-			return nil, err
-		}
-	}
-
-	// === Добавляем поле "prev" ===
-	// Создаем запись для ссылки на предыдущий коммит
-	entry, err = ma.AssembleEntry("prev")
-	if err != nil {
-		return nil, err
-	}
-	// Проверяем, определен ли предыдущий коммит
-	if prev.Defined() {
-		// Если есть предыдущий коммит, сохраняем ссылку на него
-		// Это создает цепочку коммитов для отслеживания истории изменений
-		if err := entry.AssignLink(cidlink.Link{Cid: prev}); err != nil {
-			return nil, err
-		}
-	} else {
-		// Если предыдущего коммита нет (первый коммит в репозитории),
-		// устанавливаем значение null
-		if err := entry.AssignNull(); err != nil {
-			return nil, err
-		}
-	}
-
-	// === Добавляем поле "timestamp" ===
-	// Создаем запись для временной метки коммита
-	entry, err = ma.AssembleEntry("timestamp")
-	if err != nil {
-		return nil, err
-	}
-	// Сохраняем время в формате Unix timestamp (секунды с 1 января 1970 года)
-	// Это стандартный способ представления времени в компьютерных системах
-	if err := entry.AssignInt(ts.Unix()); err != nil {
-		return nil, err
-	}
-
-	// Завершаем сборку карты - проверяем, что все поля добавлены корректно
-	if err := ma.Finish(); err != nil {
-		return nil, err
-	}
-
-	// Строим финальный IPLD узел и возвращаем его
-	// Этот узел может быть сериализован и сохранен в blockstore
-	return builder.Build(), nil
+//	// коллекция "posts" готова для добавления записей
+//
+// Связанные методы: PutRecord для добавления записей в созданную коллекцию
+func (r *Repository) CreateCollection(ctx context.Context, name string) (cid.Cid, error) {
+	return r.index.CreateCollection(ctx, name)
 }
 
-// parseCommit разбирает IPLD узел коммита и извлекает из него корневой CID и CID предыдущего коммита.
-// Эта функция является обратной к buildCommitNode - она читает структуру коммита,
-// созданную ранее, и извлекает из неё необходимые данные для восстановления состояния репозитория.
+// DeleteCollection удаляет коллекцию из репозитория.
+// Этот метод является обертокой вокруг index.DeleteCollection, предоставляя
+// API уровня репозитория для удаления коллекций. Важно отметить, что удаление
+// коллекции удаляет только её запись из индекса - сами блоки данных MST и записей
+// остаются в blockstore и могут быть недоступны для сборки мусора.
 //
 // Параметры:
-//   - node: IPLD узел, представляющий коммит (должен быть картой с полями "root" и "prev")
+//   - ctx: контекст для отмены операции и передачи значений
+//   - name: имя коллекции для удаления из репозитория
 //
 // Возвращает:
-//   - cid.Cid: CID корневого узла индекса репозитория на момент этого коммита
-//   - cid.Cid: CID предыдущего коммита в цепочке (или cid.Undef если это первый коммит)
-//   - error: ошибка парсинга, если структура коммита некорректна
+//   - cid.Cid: CID материализованного узла индекса после удаления коллекции
+//   - error: ошибка удаления, если коллекция не найдена или операция не удалась
 //
-// Ожидаемая структура входного узла:
+// Поведение:
+// - Удаляет коллекцию из карты индекса репозитория
+// - Материализует обновленный индекс без удаленной коллекции
+// - Возвращает ошибку, если коллекция не существует
+// - Данные MST остаются в blockstore (только ссылка удаляется)
 //
-//	{
-//	  "root": <ссылка на корневой CID>,
-//	  "prev": <ссылка на предыдущий коммит или null>,
-//	  "timestamp": <Unix временная метка в секундах>
+// Использование:
+//
+//	rootCID, err := repo.DeleteCollection(ctx, "posts")
+//	if err != nil {
+//	    // обработка ошибки (например, коллекция не найдена)
 //	}
-func parseCommit(node datamodel.Node) (cid.Cid, cid.Cid, error) {
-	// === Извлечение поля "root" ===
-	// Ищем в узле коммита поле с ключом "root"
-	// Это поле должно содержать ссылку на корневой узел индекса репозитория
-	rootNode, err := node.LookupByString("root")
+//	// коллекция "posts" больше недоступна в репозитории
+//
+// Важно: для полного удаления данных может потребоваться сборка мусора blockstore
+func (r *Repository) DeleteCollection(ctx context.Context, name string) (cid.Cid, error) {
+	return r.index.DeleteCollection(ctx, name)
+}
+
+// HasCollection проверяет существование коллекции в репозитории.
+// Этот метод является обертокой вокруг index.HasCollection, предоставляя
+// удобный API уровня репозитория для быстрой проверки наличия коллекции
+// с указанным именем без загрузки её содержимого.
+//
+// Параметры:
+//   - name: имя коллекции для проверки существования
+//
+// Возвращает:
+//   - bool: true, если коллекция существует в репозитории; false в противном случае
+//
+// Особенности:
+// - Выполняет быструю проверку в карте индекса (O(1))
+// - Не загружает содержимое коллекции
+// - Возвращает true как для пустых, так и для непустых коллекций
+// - Потокобезопасная операция (только чтение)
+//
+// Использование:
+//
+//	if repo.HasCollection("posts") {
+//	    // коллекция "posts" существует и готова к использованию
+//	    records, err := repo.ListRecords(ctx, "posts")
+//	} else {
+//	    // коллекция не существует, возможно нужно создать
+//	    _, err := repo.CreateCollection(ctx, "posts")
+//	}
+//
+// Производительность: очень быстрая операция, подходит для частых проверок
+func (r *Repository) HasCollection(name string) bool {
+	return r.index.HasCollection(name)
+}
+
+// ListCollections возвращает отсортированные имена коллекций.
+// Этот метод является обертокой вокруг index.Collections, предоставляя
+// API уровня репозитория для получения полного списка всех коллекций
+// в репозитории, отсортированного в лексикографическом порядке.
+//
+// Возвращает:
+//   - []string: срез имен всех коллекций в репозитории, отсортированный по алфавиту
+//
+// Особенности:
+// - Возвращает копию данных, безопасную для модификации клиентским кодом
+// - Включает как пустые, так и непустые коллекции
+// - Порядок детерминирован и воспроизводим
+// - Потокобезопасная операция (только чтение)
+//
+// Использование:
+//
+//	collections := repo.ListCollections()
+//	fmt.Printf("Репозиторий содержит %d коллекций:\n", len(collections))
+//	for i, name := range collections {
+//	    fmt.Printf("%d. %s\n", i+1, name)
+//	    if repo.HasCollection(name) {
+//	        records, _ := repo.ListRecords(ctx, name)
+//	        fmt.Printf("   Записей: %d\n", len(records))
+//	    }
+//	}
+//
+// Производительность: O(n log n) где n - количество коллекций
+// Типичное использование: администрирование, отладка, пользовательские интерфейсы
+func (r *Repository) ListCollections() []string {
+	return r.index.Collections()
+}
+
+// CollectionRoot возвращает CID корня MST для коллекции.
+// Этот метод является обертокой вокруг index.CollectionRoot, предоставляя
+// API уровня репозитория для получения прямого доступа к корневому CID
+// MST структуры указанной коллекции. Используется для низкоуровневых операций
+// и интеграции с другими компонентами.
+//
+// Параметры:
+//   - name: имя коллекции для получения корня MST
+//
+// Возвращает:
+//   - cid.Cid: CID корня MST коллекции (cid.Undef для пустой коллекции)
+//   - bool: true, если коллекция найдена; false, если коллекция не существует
+//
+// Интерпретация результатов:
+// - (cid.Defined(), true): коллекция существует и содержит записи
+// - (cid.Undef, true): коллекция существует, но пуста
+// - (cid.Undef, false): коллекция не существует
+//
+// Использование:
+//
+//	rootCID, found := repo.CollectionRoot("posts")
+//	if !found {
+//	    fmt.Println("Коллекция 'posts' не существует")
+//	} else if !rootCID.Defined() {
+//	    fmt.Println("Коллекция 'posts' пуста")
+//	} else {
+//	    fmt.Printf("Коллекция 'posts' имеет корень: %s\n", rootCID.String())
+//	    // можно использовать rootCID для прямого доступа к MST
+//	}
+//
+// Применение: низкоуровневые операции, отладка, мониторинг состояния
+func (r *Repository) CollectionRoot(name string) (cid.Cid, bool) {
+	return r.index.CollectionRoot(name)
+}
+
+// CollectionRootHash возвращает байты хеша, хранящиеся в корне MST.
+// Этот метод является обертокой вокруг index.CollectionRootHash, предоставляя
+// API уровня репозитория для получения криптографического хеша корневого узла
+// MST коллекции. Хеш используется для быстрого сравнения состояний коллекций
+// без необходимости загрузки полного содержимого.
+//
+// Параметры:
+//   - ctx: контекст для отмены операции и передачи значений
+//   - name: имя коллекции для получения хеша корня
+//
+// Возвращает:
+//   - []byte: копия байтов хеша корневого узла MST
+//   - bool: true, если коллекция найдена; false, если коллекция не существует
+//   - error: ошибка получения хеша, если узел поврежден или недоступен
+//
+// Поведение для разных состояний коллекции:
+// - Коллекция не существует: (nil, false, error)
+// - Коллекция пуста: (nil, true, nil)
+// - Коллекция содержит данные: (hash_bytes, true, nil)
+//
+// Использование:
+//
+//	hash1, found1, err1 := repo.CollectionRootHash(ctx, "posts")
+//	hash2, found2, err2 := repo.CollectionRootHash(ctx, "users")
+//
+//	if found1 && found2 && err1 == nil && err2 == nil {
+//	    if bytes.Equal(hash1, hash2) {
+//	        fmt.Println("Коллекции имеют одинаковое содержимое")
+//	    } else {
+//	        fmt.Println("Коллекции различаются")
+//	    }
+//	}
+//
+// Применение: синхронизация, кэширование, проверка целостности, дедупликация
+func (r *Repository) CollectionRootHash(ctx context.Context, name string) ([]byte, bool, error) {
+	return r.index.CollectionRootHash(ctx, name)
+}
+
+// GetRecord загружает IPLD узел для записи collection/rkey.
+// Этот метод выполняет полную операцию получения записи: сначала разрешает
+// CID записи через индекс, затем загружает фактическое содержимое записи
+// из blockstore. Возвращает готовый к использованию IPLD узел с данными записи.
+//
+// Параметры:
+//   - ctx: контекст для отмены операции и передачи значений
+//   - collection: имя коллекции, содержащей искомую запись
+//   - rkey: ключ записи для поиска в указанной коллекции
+//
+// Возвращает:
+//   - datamodel.Node: IPLD узел с содержимым записи (если найдена)
+//   - bool: true, если запись найдена и загружена; false, если запись не существует
+//   - error: ошибка операции (коллекция не найдена, запись повреждена, blockstore недоступен)
+//
+// Процесс выполнения:
+// 1. Поиск CID записи в индексе коллекции (index.Get)
+// 2. Если запись не найдена - возврат (nil, false, nil)
+// 3. Загрузка содержимого записи из blockstore по CID
+// 4. Возврат десериализованного IPLD узла
+//
+// Использование:
+//
+//	node, found, err := repo.GetRecord(ctx, "posts", "post123")
+//	if err != nil {
+//	    return fmt.Errorf("ошибка получения записи: %w", err)
+//	}
+//	if !found {
+//	    return fmt.Errorf("запись не найдена")
+//	}
+//
+//	// Работа с содержимым записи
+//	titleNode, _ := node.LookupByString("title")
+//	title, _ := titleNode.AsString()
+//	fmt.Printf("Заголовок поста: %s\n", title)
+//
+// Производительность: O(log n) для поиска + O(1) для загрузки из blockstore
+func (r *Repository) GetRecord(ctx context.Context, collection, rkey string) (datamodel.Node, bool, error) {
+	// === Поиск CID записи в индексе ===
+	// Используем индекс для разрешения логического адреса (collection, rkey) в CID
+	c, ok, err := r.index.Get(ctx, collection, rkey)
+	if err != nil || !ok {
+		// Если произошла ошибка поиска или запись не найдена,
+		// возвращаем результат без попытки загрузки
+		return nil, ok, err
+	}
+
+	// === Загрузка содержимого записи ===
+	// Получаем IPLD узел записи из blockstore по найденному CID
+	n, err := r.bs.GetNode(ctx, c)
 	if err != nil {
-		// Если поле "root" отсутствует, коммит считается некорректным
-		// Возвращаем неопределенные CID и описательную ошибку
-		return cid.Undef, cid.Undef, fmt.Errorf("commit missing root: %w", err)
+		// Если не удается загрузить узел (поврежденные данные, недоступность blockstore),
+		// возвращаем ошибку. Запись существует в индексе, но недоступна
+		return nil, false, err
 	}
 
-	// Инициализируем CID корня как неопределенный
-	rootCID := cid.Undef
-
-	// Проверяем, не является ли поле "root" значением null
-	// null означает пустой репозиторий без коллекций
-	if !rootNode.IsNull() {
-		// Преобразуем найденный узел в ссылку (Link)
-		// В IPLD ссылки представляют CID-указатели на другие узлы
-		rootLink, err := rootNode.AsLink()
-		if err != nil {
-			// Если узел не является ссылкой, структура коммита нарушена
-			return cid.Undef, cid.Undef, fmt.Errorf("commit root is not a link: %w", err)
-		}
-
-		// Приводим общий тип Link к конкретному типу cidlink.Link
-		// cidlink.Link - это обертка IPLD для CID, содержащая поле Cid
-		rl, ok := rootLink.(cidlink.Link)
-		if !ok {
-			// Если приведение типа не удалось, значит ссылка имеет неожиданный тип
-			return cid.Undef, cid.Undef, fmt.Errorf("commit root link type unexpected")
-		}
-		rootCID = rl.Cid
-	}
-
-	// === Извлечение поля "prev" ===
-	// Ищем поле "prev", которое содержит ссылку на предыдущий коммит
-	// Это поле может быть null для первого коммита в цепочке
-	prevNode, err := node.LookupByString("prev")
-	if err != nil {
-		// Если поле "prev" отсутствует, коммит считается некорректным
-		return cid.Undef, cid.Undef, fmt.Errorf("commit missing prev: %w", err)
-	}
-
-	// Инициализируем CID предыдущего коммита как неопределенный
-	// Это значение останется, если prev равно null (первый коммит)
-	prevCID := cid.Undef
-
-	// Проверяем, не является ли поле "prev" значением null
-	// null означает, что это первый коммит в репозитории без предшественников
-	if !prevNode.IsNull() {
-		// Если prev не null, значит есть предыдущий коммит
-		// Преобразуем узел в ссылку для извлечения CID
-		prevLink, err := prevNode.AsLink()
-		if err != nil {
-			// Если prev не null, но и не ссылка - ошибка структуры
-			return cid.Undef, cid.Undef, fmt.Errorf("commit prev is not a link: %w", err)
-		}
-
-		// Приводим ссылку к типу cidlink.Link для доступа к CID
-		pl, ok := prevLink.(cidlink.Link)
-		if !ok {
-			// Если тип ссылки неожиданный, сообщаем об ошибке
-			return cid.Undef, cid.Undef, fmt.Errorf("commit prev link type unexpected")
-		}
-
-		// Извлекаем CID предыдущего коммита из ссылки
-		// Теперь prevCID содержит валидный CID вместо Undef
-		prevCID = pl.Cid
-	}
-
-	// Возвращаем успешно извлеченные CID:
-	// - rootCID: CID корневого узла индекса на момент коммита (или Undef для пустого репозитория)
-	// - prevCID: CID предыдущего коммита (или Undef для первого коммита)
-	// - nil: отсутствие ошибок при парсинге
-	return rootCID, prevCID, nil
+	// Успешно получили и десериализовали запись
+	return n, true, nil
 }
 
-// indexRecordInSQLite индексирует запись в SQLite для быстрого поиска
-func (r *Repository) indexRecordInSQLite(ctx context.Context, recordCID cid.Cid, collection, rkey string, node datamodel.Node) error {
-	// Извлекаем данные из IPLD узла
-	data, err := r.extractDataFromNode(node)
-	if err != nil {
-		return fmt.Errorf("failed to extract data from node: %w", err)
-	}
-
-	// Генерируем текст для полнотекстового поиска
-	searchText := r.generateSearchText(data)
-
-	// Создаем метаданные для индексирования
-	metadata := IndexMetadata{
-		Collection: collection,
-		RKey:       rkey,
-		RecordType: r.inferRecordType(collection, data),
-		Data:       data,
-		SearchText: searchText,
-		CreatedAt:  time.Now(),
-		UpdatedAt:  time.Now(),
-	}
-
-	return r.sqliteIndex.IndexRecord(ctx, recordCID, metadata)
+// ListRecords возвращает упорядоченные записи (rkey, CID значения) в коллекции.
+// Этот метод является обертокой вокруг index.ListCollection, предоставляя
+// API уровня репозитория для получения полного списка записей в указанной
+// коллекции. Записи возвращаются в лексикографическом порядке их ключей.
+//
+// Параметры:
+//   - ctx: контекст для отмены операции и передачи значений
+//   - collection: имя коллекции для получения списка записей
+//
+// Возвращает:
+//   - []mst.Entry: срез записей коллекции, упорядоченный по rkey
+//   - error: ошибка получения списка, если коллекция не найдена или MST недоступен
+//
+// Структура mst.Entry:
+//
+//	type Entry struct {
+//	    Key   string   // rkey записи (уникальный ключ в коллекции)
+//	    Value cid.Cid  // CID содержимого записи в blockstore
+//	}
+//
+// Особенности:
+// - Пустая коллекция возвращает пустой срез (не nil)
+// - Порядок записей детерминирован (лексикографический по rkey)
+// - MST обеспечивает эффективный обход в порядке сортировки
+// - Возвращаются только метаданные записей (ключи и CID), не содержимое
+//
+// Использование:
+//
+//	entries, err := repo.ListRecords(ctx, "posts")
+//	if err != nil {
+//	    return fmt.Errorf("ошибка получения списка записей: %w", err)
+//	}
+//
+//	fmt.Printf("Коллекция 'posts' содержит %d записей:\n", len(entries))
+//	for i, entry := range entries {
+//	    fmt.Printf("%d. Ключ: %s, CID: %s\n", i+1, entry.Key, entry.Value.String())
+//
+//	    // При необходимости можно загрузить содержимое записи
+//	    node, found, err := repo.GetRecord(ctx, "posts", entry.Key)
+//	    if found && err == nil {
+//	        // работа с содержимым записи
+//	    }
+//	}
+//
+// Производительность: O(n) где n - количество записей в коллекции
+// Применение: листинги, экспорт данных, администрирование, отладка
+func (r *Repository) ListRecords(ctx context.Context, collection string) ([]mst.Entry, error) {
+	return r.index.ListCollection(ctx, collection)
 }
 
-// extractDataFromNode извлекает данные из IPLD узла в map[string]interface{}
-func (r *Repository) extractDataFromNode(node datamodel.Node) (map[string]interface{}, error) {
-	result := make(map[string]interface{})
-
-	// Обходим все поля узла
-	iterator := node.MapIterator()
-	for !iterator.Done() {
-		key, value, err := iterator.Next()
-		if err != nil {
-			return nil, err
-		}
-
-		keyStr, err := key.AsString()
-		if err != nil {
-			continue // Пропускаем нестроковые ключи
-		}
-
-		// Конвертируем значение в go типы
-		goValue, err := r.nodeToGoValue(value)
-		if err != nil {
-			continue // Пропускаем проблемные значения
-		}
-
-		result[keyStr] = goValue
-	}
-
-	return result, nil
+// InclusionPath возвращает путь CID узлов от корня до позиции поиска для rkey.
+// Этот метод является обертокой вокруг index.InclusionPath, предоставляя
+// API уровня репозитория для построения пути включения (inclusion path)
+// в MST структуре коллекции. Используется для создания криптографических
+// доказательств включения или исключения записей.
+//
+// Параметры:
+//   - ctx: контекст для отмены операции и передачи значений
+//   - collection: имя коллекции для построения пути
+//   - rkey: ключ записи для поиска пути
+//
+// Возвращает:
+//   - []cid.Cid: срез CID узлов от корня MST до позиции поиска
+//   - bool: true, если rkey существует в дереве; false, если ключ отсутствует
+//   - error: ошибка построения пути, если коллекция не найдена или узлы недоступны
+//
+// Структура пути:
+// - path[0]: корневой узел MST коллекции
+// - path[1]: узел второго уровня (левый или правый потомок корня)
+// - ...
+// - path[n-1]: конечный узел (содержащий ключ или позицию для вставки)
+//
+// Применение inclusion path:
+// 1. Криптографические доказательства включения/исключения
+// 2. Верификация целостности данных
+// 3. Синхронизация между репозиториями
+// 4. Аудит и мониторинг изменений
+//
+// Использование:
+//
+//	path, present, err := repo.InclusionPath(ctx, "posts", "post123")
+//	if err != nil {
+//	    return fmt.Errorf("ошибка построения пути: %w", err)
+//	}
+//
+//	if present {
+//	    fmt.Printf("Запись 'post123' найдена, путь включения: %d узлов\n", len(path))
+//	    for i, cid := range path {
+//	        fmt.Printf("  Уровень %d: %s\n", i, cid.String())
+//	    }
+//	} else {
+//	    fmt.Printf("Запись 'post123' отсутствует, путь исключения: %d узлов\n", len(path))
+//	}
+//
+// Производительность: O(log n) где n - количество записей в коллекции
+func (r *Repository) InclusionPath(ctx context.Context, collection, rkey string) ([]cid.Cid, bool, error) {
+	return r.index.InclusionPath(ctx, collection, rkey)
 }
 
-// nodeToGoValue конвертирует IPLD Node в Go значение
-func (r *Repository) nodeToGoValue(node datamodel.Node) (interface{}, error) {
-	switch node.Kind() {
-	case datamodel.Kind_String:
-		return node.AsString()
-	case datamodel.Kind_Bool:
-		return node.AsBool()
-	case datamodel.Kind_Int:
-		return node.AsInt()
-	case datamodel.Kind_Float:
-		return node.AsFloat()
-	case datamodel.Kind_List:
-		var result []interface{}
-		iterator := node.ListIterator()
-		for !iterator.Done() {
-			_, value, err := iterator.Next()
-			if err != nil {
-				return nil, err
-			}
-			goValue, err := r.nodeToGoValue(value)
-			if err != nil {
-				continue
-			}
-			result = append(result, goValue)
-		}
-		return result, nil
-	case datamodel.Kind_Map:
-		result := make(map[string]interface{})
-		iterator := node.MapIterator()
-		for !iterator.Done() {
-			key, value, err := iterator.Next()
-			if err != nil {
-				return nil, err
-			}
-			keyStr, err := key.AsString()
-			if err != nil {
-				continue
-			}
-			goValue, err := r.nodeToGoValue(value)
-			if err != nil {
-				continue
-			}
-			result[keyStr] = goValue
-		}
-		return result, nil
-	default:
-		return fmt.Sprintf("%v", node), nil
-	}
-}
-
-// generateSearchText создает текст для полнотекстового поиска из данных записи
-func (r *Repository) generateSearchText(data map[string]interface{}) string {
-	var parts []string
-
-	// Обходим все поля и собираем текстовые значения
-	for key, value := range data {
-		parts = append(parts, key) // Добавляем имя поля
-
-		switch v := value.(type) {
-		case string:
-			parts = append(parts, v)
-		case []interface{}:
-			for _, item := range v {
-				if str, ok := item.(string); ok {
-					parts = append(parts, str)
-				}
-			}
-		case map[string]interface{}:
-			// Рекурсивно обрабатываем вложенные объекты
-			for _, nested := range v {
-				if str, ok := nested.(string); ok {
-					parts = append(parts, str)
-				}
-			}
-		}
+// ExportCollectionCAR записывает CARv2 для MST коллекции, используя explore-all селектор.
+// Этот метод экспортирует полное содержимое коллекции в формате CAR (Content Addressable aRchive),
+// включая все узлы MST и связанные данные. CAR файл может использоваться для резервного
+// копирования, передачи данных между системами или автономного хранения коллекции.
+//
+// Параметры:
+//   - ctx: контекст для отмены операции и передачи значений
+//   - collection: имя коллекции для экспорта
+//   - w: io.Writer для записи CAR данных (файл, сетевое соединение, буфер)
+//
+// Возвращает:
+//   - error: ошибка экспорта, если коллекция не найдена, пуста или запись не удалась
+//
+// Поведение:
+// - Коллекция не существует: возвращает ошибку "collection not found"
+// - Коллекция пуста: возвращает ошибку "collection is empty"
+// - Коллекция содержит данные: экспортирует все связанные блоки в CAR формат
+//
+// Особенности CAR экспорта:
+// - Используется CARv2 формат (совместим с IPFS/IPLD экосистемой)
+// - explore-all селектор включает все достижимые узлы от корня MST
+// - Экспортируются как узлы MST структуры, так и содержимое записей
+// - Результирующий файл является самодостаточным архивом
+//
+// Использование:
+//
+//	// Экспорт в файл
+//	file, err := os.Create("posts_backup.car")
+//	if err != nil {
+//	    return err
+//	}
+//	defer file.Close()
+//
+//	err = repo.ExportCollectionCAR(ctx, "posts", file)
+//	if err != nil {
+//	    return fmt.Errorf("ошибка экспорта коллекции: %w", err)
+//	}
+//	fmt.Println("Коллекция 'posts' успешно экспортирована")
+//
+//	// Экспорт в буфер для передачи по сети
+//	var buffer bytes.Buffer
+//	err = repo.ExportCollectionCAR(ctx, "users", &buffer)
+//	if err == nil {
+//	    // отправка buffer.Bytes() по сети
+//	}
+//
+// Применение: резервное копирование, миграция данных, обмен между системами
+// Производительность: O(n) где n - общий размер всех блоков в коллекции
+func (r *Repository) ExportCollectionCAR(ctx context.Context, collection string, w io.Writer) error {
+	// === Получение корня MST коллекции ===
+	// Проверяем существование коллекции и получаем её корневой CID
+	root, ok := r.index.CollectionRoot(collection)
+	if !ok {
+		// Если коллекция не найдена в индексе, возвращаем ошибку
+		return fmt.Errorf("collection not found: %s", collection)
 	}
 
-	return strings.Join(parts, " ")
-}
-
-// inferRecordType определяет тип записи на основе коллекции и данных
-func (r *Repository) inferRecordType(collection string, data map[string]interface{}) string {
-	// Пытаемся определить тип из поля $type
-	if recordType, exists := data["$type"]; exists {
-		if typeStr, ok := recordType.(string); ok {
-			return typeStr
-		}
+	// === Проверка на пустую коллекцию ===
+	// Если корень MST не определен, коллекция пуста и экспортировать нечего
+	if !root.Defined() {
+		return fmt.Errorf("collection is empty: %s", collection)
 	}
 
-	// Определяем тип на основе имени коллекции
-	switch collection {
-	case "posts", "app.bsky.feed.post":
-		return "post"
-	case "follows", "app.bsky.graph.follow":
-		return "follow"
-	case "likes", "app.bsky.feed.like":
-		return "like"
-	case "profiles", "app.bsky.actor.profile":
-		return "profile"
-	default:
-		return "record"
-	}
+	// === Подготовка селектора для экспорта ===
+	// Создаем explore-all селектор, который включает все достижимые узлы
+	// от корневого CID. Это гарантирует полный экспорт MST структуры и данных
+	selectorNode := blockstore.BuildSelectorNodeExploreAll()
+
+	// === Выполнение экспорта в CAR формат ===
+	// Используем blockstore для создания CARv2 архива, начиная с корневого CID
+	// и следуя всем ссылкам согласно селектору
+	return r.bs.ExportCARV2(ctx, root, selectorNode, w)
 }
