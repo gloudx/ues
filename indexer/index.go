@@ -40,8 +40,8 @@ import (
 type Index struct {
 	bs    blockstore.Blockstore
 	mu    sync.RWMutex
-	roots map[string]cid.Cid // collection name -> MST root
 	root  cid.Cid            // CID of materialized index node (map of collections)
+	roots map[string]cid.Cid // collection name -> MST root
 }
 
 // NewIndex создает новый пустой индекс, поддерживаемый указанным блочным хранилищем.
@@ -61,8 +61,8 @@ type Index struct {
 func NewIndex(bs blockstore.Blockstore) *Index {
 	return &Index{
 		bs:    bs,
-		roots: make(map[string]cid.Cid),
 		root:  cid.Undef,
+		roots: make(map[string]cid.Cid),
 	}
 }
 
