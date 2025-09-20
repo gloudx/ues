@@ -6,10 +6,10 @@ import (
 	"log"
 	"os"
 	"ues/blockstore"
-	"ues/datastore"
+	ds "ues/datastore"
 	"ues/repository"
 
-	sd "github.com/ipfs/go-datastore"
+	"github.com/ipfs/go-datastore"
 	"github.com/ipld/go-ipld-prime/codec/dagcbor"
 	"github.com/ipld/go-ipld-prime/multicodec"
 	"github.com/ipld/go-ipld-prime/node/basicnode"
@@ -30,7 +30,7 @@ func main() {
 	}
 	defer os.RemoveAll(tempDir)
 
-	ds, err := datastore.NewDatastorage(tempDir, nil)
+	ds, err := ds.NewDatastorage(tempDir, nil)
 	if err != nil {
 		log.Fatalf("Ошибка создания datastore: %v", err)
 	}
@@ -79,7 +79,7 @@ func main() {
 	document := nodeBuilder.Build()
 
 	// Добавляем документ с ключом "ooo"
-	recordCID, err := repo.PutRecord(ctx, "xxx", "ooo", document)
+	recordCID, err := repo.PutRecord(ctx, "xxx", datastore.NewKey("ooo").String(), document)
 	if err != nil {
 		log.Fatalf("Ошибка добавления записи: %v", err)
 	}
@@ -147,7 +147,7 @@ func main() {
 		fmt.Println("Документ не найден!")
 	}
 
-	keys, es, err := ds.Keys(context.Background(), sd.NewKey("/"))
+	keys, es, err := ds.Keys(context.Background(), datastore.RawKey(""))
 	if err != nil {
 		log.Fatalf("Ошибка получения ключей из datastore: %v", err)
 	}
