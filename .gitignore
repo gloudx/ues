@@ -34,3 +34,6 @@ go.work.sum
 .gocache
 x
 .data
+cmd
+*.md
+*.sh
